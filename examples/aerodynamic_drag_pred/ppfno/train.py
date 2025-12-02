@@ -18,6 +18,7 @@ import numpy as np
 import paddle
 import pyvista as pv
 import vtk
+import math
 from omegaconf import DictConfig
 from paddle import distributed as dist
 from paddle.distributed import ParallelEnv
@@ -111,6 +112,17 @@ def save_vtp_from_dict(
         logging.info(f"Visualization result is saved to: {filename}.vtp")
 
 
+def calculate_lateral_angle(car_speed, wind_speed, wind_angle):
+
+    wind_direction_rad = math.radians(wind_angle)
+    lateral_component = wind_speed * math.cos(wind_direction_rad) + car_speed
+    longitudinal_component = wind_speed * math.sin(wind_direction_rad)
+    side_bias_angle_rad = math.atan2(longitudinal_component, lateral_component)
+    side_bias_angle_deg = math.degrees(side_bias_angle_rad)
+    
+    return side_bias_angle_deg
+
+
 def train(cfg: DictConfig):
     os.makedirs(cfg.train_output_path, exist_ok=True)
     os.makedirs(os.path.join(cfg.train_output_path, "log"), exist_ok=True)
@@ -129,10 +141,7 @@ def train(cfg: DictConfig):
     logging.getLogger().addHandler(stream_handler)
 
     os.makedirs(os.path.join(cfg.train_output_path, "json"), exist_ok=True)
-    train_json_file_path = os.path.join(cfg.train_output_path, "json", "train.json")
-    coefficent_json_file_path = os.path.join(
-        cfg.train_output_path, "json", "coefficent.json"
-    )
+    train_json_file_path = os.path.join(cfg.train_output_path, "json", "loss.json")
 
     def create_json(json_file_path):
         os.makedirs(os.path.dirname(json_file_path), exist_ok=True)
@@ -142,7 +151,6 @@ def train(cfg: DictConfig):
             json.dump([], file)
 
     create_json(train_json_file_path)
-    create_json(coefficent_json_file_path)
 
     def append_dict_to_json_list(file_path, dict_element):
         assert os.path.exists(file_path), file_path
@@ -151,6 +159,8 @@ def train(cfg: DictConfig):
 
         if isinstance(data, list):
             data.append(dict_element)
+        elif isinstance(data, dict):
+            data.update(dict_element)
         else:
             logging.info("Error: The root of the JSON file is not a list.")
             return
@@ -209,23 +219,10 @@ def train(cfg: DictConfig):
     # all_files = os.listdir(cfg.train_input_path)
     # prefix = "area"
     os.makedirs(os.path.join(cfg.train_output_path, "json"), exist_ok=True)
-    """
-    {
-        "test_case_id":
-        [
-        SFE-CR450AF-U3-FZ-001-202503,
-        SFE-CR450AF-U3-FZ-001-202504
-        ],
-        "train_case_id":
-        [
-        SFE-CR450AF-U3-FZ-001-202505,
-        SFE-CR450AF-U3-FZ-001-202506
-        ]
-    }
-    """
+
     data = {
-        "test_case_id": datamodule.test_full_caseids,
-        "train_case_id": datamodule.train_full_caseids,
+        "test_case_id": datamodule.test_indices,
+        "train_case_id": datamodule.train_indices,
     }
     if paddle.distributed.get_rank() == 0:
         with open(
@@ -234,20 +231,23 @@ def train(cfg: DictConfig):
             json.dump(data, json_file, indent=4, ensure_ascii=False)
 
     eval_meter = AverageMeterDict()
-    visualize_data_dicts = []
 
     if paddle.distributed.get_rank() == 0:
-        logging.info(f"train indices: {datamodule.train_full_caseids}")
-        logging.info(f"test indices: {datamodule.test_full_caseids}")
+        logging.info(f"train indices: {datamodule.train_indices}")
+        logging.info(f"test indices: {datamodule.test_indices}")
 
     def cal_mre(pred, label):
         return paddle.abs(x=pred - label) / paddle.abs(x=label)
 
     def evaluate_on_fly(epoch_id) -> int | None:
         t1 = default_timer()
-        max_cd_error = 0.0
+        max_error = 0.0
+        min_error = float("inf")
+        total_error = 0
+        F_error = [0.0, 0.0, 0.0]
+        M_error = [0.0, 0.0, 0.0]
         max_loss_case_id = None
-        coefficent_json_dict = []
+        min_loss_case_id = None
         if paddle.distributed.get_rank() == 0:
             logging.info(
                 f"Start evaluting {cfg.model} at epoch {epoch_id}, number of samples: {len(test_dataloader)}"
@@ -255,6 +255,17 @@ def train(cfg: DictConfig):
 
         indices = datamodule.test_indices
         full_indices = datamodule.test_full_caseids
+        error_dict = {key:0.0 for key in indices}
+
+        sideslip_filename={}
+        for key in indices:
+            sideslip_filename[key] = os.path.join(
+                cfg.train_output_path,
+                "json",
+                f"{str(key)}",
+                "sideslip_angle.json",
+            )
+            create_json(sideslip_filename[key])
 
         current_model = eval_model if "eval_model" in locals() else model
         is_train = current_model.training
@@ -268,11 +279,11 @@ def train(cfg: DictConfig):
             device = ParallelEnv().device_id
             device = paddle.CUDAPlace(device)
             try:
-                out_dict, pred, truth, cd_dict = current_model.eval_dict(
+                out_dict, pred, truth, F_M_dict = current_model.eval_dict(
                     device, data_dict, loss_fn=loss_fn, decode_fn=datamodule.decode
                 )
 
-                if paddle.any(paddle.isnan(cd_dict["Cd_truth"])):
+                if paddle.any(paddle.isnan(F_M_dict["F_truth"])) or paddle.any(paddle.isnan(F_M_dict["M_truth"])):
                     logging.info(
                         f"WARNING: nan detected on test sample {i}, skipping this sample."
                     )
@@ -283,11 +294,31 @@ def train(cfg: DictConfig):
                         cfg,
                         pred,
                         truth,
-                        indices[i],
+                        full_indices[i],
                         epoch_id,
                         decode_fn=datamodule.decode,
                         caseid=datamodule.test_full_caseids[i],
                     )
+                    # save json output file
+                    caseid=datamodule.test_full_caseids[i]
+                    json_filename = os.path.join(
+                        cfg.train_output_path,
+                        "csv_vtp",
+                        str(epoch_id),
+                        f"{str(caseid)[:20]}",
+                        f"{str(caseid)[21:]}",
+                        "case.json",
+                    )
+                    os.makedirs(os.path.dirname(json_filename), exist_ok=True)
+                    with open(json_filename, "w") as f:
+                        json.dump(
+                            {
+                                "car_speed": data_dict["info"][0]["car_speed"],
+                                "wind_speed": data_dict["info"][0]["wind_speed"],
+                                "wind_angle": data_dict["info"][0]["wind_angle"],
+                            },
+                            f,
+                        )   
                 # paddle.device.cuda.empty_cache()
             except MemoryError as e:
                 if "Out of memory" in str(e):
@@ -305,79 +336,118 @@ def train(cfg: DictConfig):
                     eval_meter.update({k: v})
             msg += f"|| MRE and Value: "
             for k, v in out_dict.items():
-                if "Cd" and "pred" in k.split("_"):
+                if "pred" in k.split("_") and ("F" or "M" in k.split("_")):
                     k_truth = f"{k[:k.rfind('_')]}_truth"
                     mre = cal_mre(v, out_dict[k_truth])
                     eval_meter.update({f"MRE_{k[:k.rfind('_')]}": mre})
-                    msg += f"MRE_{k[:k.rfind('_')]}: {mre.item():.4f}, "
-                    msg += f"[{k}: {v:.4f}, {k_truth}: {out_dict[k_truth]:.4f}], "
-                    if k == "Cd_pred" and max_cd_error < mre.item():
-                        max_cd_error = mre.item()
-                        max_loss_case_id = i
+                    msg += f"MRE_{k[:k.rfind('_')]}: {mre.numpy()}, "
+                    msg += f"[{k}: {v.numpy()}, {k_truth}: {out_dict[k_truth].numpy()}], "
+                    if k == "F_pred" :
+                        F_error = mre.numpy()
+                    if k == "M_pred" :
+                        M_error = mre.numpy()
 
-            Cd_pred_modify = cd_dict["Cd_pred_modify"]
-            Cd_truth = out_dict["Cd_truth"]
-            Cd_pred = out_dict["Cd_pred"]
-            Cd_mre_modify = paddle.abs(x=Cd_pred_modify - Cd_truth) / paddle.abs(
-                x=Cd_truth
+            # if F_error.sum() + M_error.sum() > max_error:
+            #     max_error = F_error.sum() + M_error.sum()
+            #     max_loss_case_id = i
+            # if F_error.sum() + M_error.sum() < min_error:
+            #     min_error = F_error.sum() + M_error.sum()
+            #     min_loss_case_id = i
+            total_error += F_error.sum() + M_error.sum()
+
+            F_pred_modify = F_M_dict["F_pred_modify"]
+            M_pred_modify = F_M_dict["M_pred_modify"]
+            F_truth = out_dict["F_truth"]
+            M_truth = out_dict["M_truth"]
+            F_pred = out_dict["F_pred"]
+            M_pred = out_dict["M_pred"]
+            F_mre_modify = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
+                x=F_truth
             )
-            case_coefficent_json_dict[
-                f"cal_total_drag_coefficient"
-            ] = Cd_pred_modify.item()
-            case_coefficent_json_dict[f"real_total_drag_coefficient"] = Cd_truth.item()
-            case_coefficent_json_dict[f"cal_pressure_drag_coefficient"] = out_dict[
-                "Cd_pressure_pred"
-            ].item() + (Cd_pred_modify.item() - Cd_pred.item())
-            case_coefficent_json_dict[f"real_pressure_drag_coefficient"] = out_dict[
-                "Cd_pressure_truth"
-            ].item()
-            case_coefficent_json_dict[
-                f"cal_friction_resistance_coefficient"
-            ] = out_dict["Cd_wallshearstress_pred"].item()
-            case_coefficent_json_dict[
-                f"real_friction_resistance_coefficient"
-            ] = out_dict["Cd_wallshearstress_truth"].item()
-            case_coefficent_json_dict[f"cal_error_total_drag_coefficient"] = (
-                Cd_truth.item() - Cd_pred_modify.item()
-            )
-            case_coefficent_json_dict[f"cal_err_pressure_drag_coefficient"] = (
-                out_dict["Cd_pressure_truth"].item()
-                - case_coefficent_json_dict[f"cal_pressure_drag_coefficient"]
-            )
-            case_coefficent_json_dict[f"cal_err_friction_resistance_coefficient"] = (
-                out_dict["Cd_wallshearstress_truth"].item()
-                - out_dict["Cd_wallshearstress_pred"].item()
+            M_mre_modify = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
+                x=M_truth
             )
 
-            case_coefficent_json_dict["case_id"] = full_indices[i]
-            coefficent_json_dict.append(case_coefficent_json_dict)
+            load_types = {
+                'aerodynamic_lift': {'real': F_M_dict['F_truth'][1], 'pred': F_M_dict['F_pred'][1]},
+                'aerodynamic_drag': {'real': F_M_dict['F_truth'][0], 'pred': F_M_dict['F_pred'][0]},
+                'pneumatic_lateral_force': {'real': F_M_dict['F_truth'][2], 'pred': F_M_dict['F_pred'][2]},
+                'pneumatic_overturning_moment': {'real': F_M_dict['M_truth'][0], 'pred': F_M_dict['M_pred'][0]},
+                'pneumatic_pitching_moment': {'real': F_M_dict['M_truth'][1], 'pred': F_M_dict['M_pred'][1]},
+                'pneumatic_roll_moment': {'real': F_M_dict['M_truth'][2], 'pred': F_M_dict['M_pred'][2]},
+            }
 
-            msg += f"MRE_Cd_modify: {Cd_mre_modify.item():.4f}, "
-            msg += f"[Cd_pred_modify: {Cd_pred_modify.item():.4f}, "
-            msg += f"Cd_truth: {Cd_truth.item():.4f}], "
+            sideslip_angle = calculate_lateral_angle(
+                data_dict["info"][0]["car_speed"], 
+                data_dict["info"][0]["wind_speed"], 
+                data_dict["info"][0]["wind_angle"]
+            )
+
+            case_coefficent_json_dict['type_value'] = sideslip_angle
+            case_coefficent_json_dict['car_speed'] = data_dict["info"][0]["car_speed"]
+            case_coefficent_json_dict['wind_speed'] = data_dict["info"][0]["wind_speed"]
+            case_coefficent_json_dict['wind_angle'] = data_dict["info"][0]["wind_angle"]
+
+
+            for load_name, values in load_types.items():
+                real_val = values['real'].numpy() if hasattr(values['real'], 'numpy') else values['real']
+                cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
+                cal_error = cal_val - real_val
+                case_coefficent_json_dict[load_name] = {
+                    'real_value': float(real_val),
+                    'cal_value': float(cal_val),
+                    'cal_error': float(cal_error)
+                }
+
+            caseid=datamodule.test_full_caseids[i]
+            append_dict_to_json_list(sideslip_filename[str(caseid)[:20]], case_coefficent_json_dict)
+
+            msg += f"MRE_F_modify: {F_mre_modify.numpy()}, "
+            msg += f"[F_pred_modify: {F_pred_modify.numpy()}, "
+            msg += f"F_truth: {F_truth.numpy()}], "
+            msg += f"MRE_M_modify: {M_mre_modify.numpy()}, "
+            msg += f"[M_pred_modify: {M_pred_modify.numpy()}, "
+            msg += f"M_truth: {M_truth.numpy()}], "
 
             logging.info(msg)
+        
+            error_dict[full_indices[i][:-6]] += F_error.sum() + M_error.sum()
+
+        max_loss_case_id = max(error_dict, key=error_dict.get)
+        min_loss_case_id = min(error_dict, key=error_dict.get)
+        max_error = error_dict[max_loss_case_id]
+        min_error = error_dict[min_loss_case_id]
 
         t2 = default_timer()
         msg = f"Testing took {t2 - t1:.2f} seconds. Everage eval values: "
         eval_dict = eval_meter.avg
         for k, v in eval_dict.items():
-            msg += f"{v.item():.4f}({k}), "
+            msg += f"{v.numpy()}({k}), "
 
         if is_train:
             current_model.train()
 
-        if max_loss_case_id is not None:
-            msg += f"Maximum Cd Error Sample ID: {datamodule.test_full_caseids[max_loss_case_id]}(index={max_loss_case_id}), Maximum Cd Error: {max_cd_error:.4f}"
+        if max_loss_case_id is not None and min_loss_case_id is not None:
+            msg += f"Maximum Error Sample ID: {max_loss_case_id}, Maximum Error: {max_error}, "
+            msg += f"Minimum Error Sample ID: {min_loss_case_id}, Minimum Error: {min_error}, "
+        elif max_loss_case_id is not None:
+            msg += f"Maximum Error Sample ID: {max_loss_case_id}, Maximum Error: {max_error}, "
+        elif min_loss_case_id is not None:
+            msg += f"Minimum Error Sample ID: {min_loss_case_id}, Minimum Error: {min_error}, "
         else:
-            msg += "Wawrning: No maximum Cd Error, because all samples are not evaluated, might for OMM or other reason."
+            msg += "Wawrning: No maximum and minimum Error, because all samples are not evaluated, might for OMM or other reason."
         logging.info(msg)
 
-        if max_loss_case_id is not None:
-            return datamodule.test_full_caseids[max_loss_case_id], coefficent_json_dict
+        if max_loss_case_id is not None and min_loss_case_id is not None:
+            return max_loss_case_id, min_loss_case_id, total_error
+        elif max_loss_case_id is not None:
+            return max_loss_case_id, None, total_error
+        elif min_loss_case_id is not None:
+            return None, min_loss_case_id, total_error
         else:
-            return None, coefficent_json_dict
+            return None, None, total_error
 
+    best_error = float('inf')
     for ep in range(cfg.num_epochs):
         if paddle.distributed.get_rank() == 0:
             train_json_dict = {}
@@ -428,15 +498,15 @@ def train(cfg: DictConfig):
                     msg += f"Memory Usage: {memory_allocated:.2f} GB (forward), "
 
                 optimizer.clear_gradients(set_to_zero=False)
-                pred, truth, cd_dict = model(
+                pred, truth, F_M_dict = model(
                     data_dict, idx_batch, loss_fn=loss_fn, decode_fn=datamodule.decode
                 )
-                if "OOM" in cd_dict:
-                    if cd_dict["OOM"] == True:
+                if "OOM" in F_M_dict:
+                    if F_M_dict["OOM"] == True:
                         idx_batch += 1
                         continue
-                    elif cd_dict["OOM"] == False and paddle.any(
-                        paddle.isnan(cd_dict["Cd_truth"])
+                    elif F_M_dict["OOM"] == False and paddle.any(
+                        paddle.isnan(F_M_dict["F_truth"])
                     ):
                         logging.info(
                             f"WARNING: nan detected on sample {idx_batch}, skipping this sample."
@@ -455,8 +525,8 @@ def train(cfg: DictConfig):
                 else:
                     raise
             loss = paddle.to_tensor(data=0.0).cuda(blocking=True)
-            # print('cd_dict:', cd_dict)
-            if cd_dict == {}:
+
+            if F_M_dict == {}:
                 for i in range(len(cfg.out_keys)):
                     key = cfg.out_keys[i]
                     st, end = (
@@ -469,27 +539,47 @@ def train(cfg: DictConfig):
 
                     loss += cfg.weight_list[i] * loss_key
             else:
-                Cd_pred_modify = cd_dict["Cd_pred_modify"]
-                Cd_truth = cd_dict["Cd_truth"]
-                Cd_pred = cd_dict["Cd_pred"]
-                Cd_mre = paddle.abs(x=Cd_pred_modify - Cd_truth) / paddle.abs(
-                    x=Cd_truth
+                F_pred_modify = F_M_dict["F_pred_modify"]
+                M_pred_modify = F_M_dict["M_pred_modify"]
+                F_truth = F_M_dict["F_truth"]
+                M_truth = F_M_dict["M_truth"]
+                F_pred = F_M_dict["F_pred"]
+                M_pred = F_M_dict["M_pred"]
+                F_mre = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
+                    x=F_truth
                 )
-                loss += paddle.nn.functional.mse_loss(Cd_pred_modify, Cd_truth)
+                M_mre = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
+                    x=M_truth
+                )
+                
+                loss += paddle.nn.functional.mse_loss(F_pred_modify, F_truth)
+                loss += paddle.nn.functional.mse_loss(M_pred_modify, M_truth)
 
                 train_l2_meter.update(
-                    {"pressure": cd_dict["L2_pressure"].detach().item()}
+                    {"pressure": F_M_dict["L2_pressure"].detach().item()}
                 )
                 train_l2_meter.update(
-                    {"wallshearstress": cd_dict["L2_wallshearstress"].detach().item()}
+                    {"wallshearstress": F_M_dict["L2_wallshearstress"].detach().item()}
                 )
+
                 train_l2_meter.update({"MSE_loss": loss.detach().item()})
-                train_l2_meter.update({"Cd_mre": Cd_mre.detach().item()})
-                train_l2_meter.update({"Cd_pred": Cd_pred.detach().item()})
+                train_l2_meter.update({"F_mre": F_mre.numpy()})
+                train_l2_meter.update({"M_mre": M_mre.numpy()})
+                train_l2_meter.update({"F_pred": F_pred.numpy()})
+                train_l2_meter.update({"M_pred": M_pred.numpy()})
                 train_l2_meter.update(
-                    {"Cd_pred_modify": Cd_pred_modify.detach().item()}
+                    {"F_pred_modify": F_pred_modify.numpy()}
                 )
-                train_l2_meter.update({"Cd_truth": Cd_truth.detach().item()})
+                train_l2_meter.update({"M_pred_modify": M_pred_modify.numpy()})
+                train_l2_meter.update({"F_truth": F_truth.numpy()})
+                train_l2_meter.update({"M_truth": M_truth.numpy()})
+                train_l2_meter.update({"aerodynamic_lift": F_mre.numpy()[1]})
+                train_l2_meter.update({"aerodynamic_drag": F_mre.numpy()[0]})
+                train_l2_meter.update({"pneumatic_lateral_force": F_mre.numpy()[2]})
+                train_l2_meter.update({"pneumatic_overturning_moment": M_mre.numpy()[0]})
+                train_l2_meter.update({"pneumatic_pitching_moment": M_mre.numpy()[1]})
+                train_l2_meter.update({"pneumatic_roll_moment": M_mre.numpy()[2]})
+                
 
             loss.backward(grad_tensor=loss)
 
@@ -514,54 +604,65 @@ def train(cfg: DictConfig):
 
         if paddle.distributed.get_rank() == 0:
             train_json_dict["epoch"] = ep
-            if "Cd_mre" in train_l2_meter.avg:
-                train_json_dict["mre"] = train_l2_meter.avg["Cd_mre"]
+            if "aerodynamic_lift" in train_l2_meter.avg:
+                train_json_dict["aerodynamic_lift"] = train_l2_meter.avg["aerodynamic_lift"]
+                train_json_dict["aerodynamic_drag"] = train_l2_meter.avg["aerodynamic_drag"]
+                train_json_dict["pneumatic_lateral_force"] = train_l2_meter.avg["pneumatic_lateral_force"]
+                train_json_dict["pneumatic_overturning_moment"] = train_l2_meter.avg["pneumatic_overturning_moment"]
+                train_json_dict["pneumatic_pitching_moment"] = train_l2_meter.avg["pneumatic_pitching_moment"]
+                train_json_dict["pneumatic_roll_moment"] = train_l2_meter.avg["pneumatic_roll_moment"]
             else:
-                train_json_dict["mre"] = 0
-            train_json_dict["pressure_loss"] = train_l2_meter.avg["pressure"]
-            train_json_dict["shear_stress_loss"] = train_l2_meter.avg["wallshearstress"]
+                train_json_dict["aerodynamic_lift"] = 0
+                train_json_dict["aerodynamic_drag"] = 0
+                train_json_dict["pneumatic_lateral_force"] = 0
+                train_json_dict["pneumatic_overturning_moment"] = 0
+                train_json_dict["pneumatic_pitching_moment"] = 0
+                train_json_dict["pneumatic_roll_moment"] = 0
 
         if num_OOM != 0:
             logging.info(f"WARNING: {num_OOM} samples OOM, skipping these samples.")
         msg_ep = f"Training epoch {ep} took {t2 - t1:.2f} seconds. L2_Loss: "
         train_dict = train_l2_meter.avg
         for k, v in train_dict.items():
-            msg_ep += f"{v:.4f}({k}), "
+            msg_ep += f"{v}({k}), "
         if paddle.distributed.get_rank() == 0 and "msg" in locals():
             logging.info(msg_ep + msg)
-        max_loss_case_id = None
+
         if ep == 0 or (ep + 1) % cfg.save_per_epoch == 0 or ep == cfg.num_epochs - 1:
             state = {"model": model.state_dict(), "lr": optimizer.get_lr(), "epoch": ep}
             os.makedirs(
                 os.path.dirname(
-                    f"{cfg.train_output_path}/pd/{cfg.model_name}.pdparams"
+                    f"{cfg.train_output_path}/pd/latest.pdparams"
                 ),
                 exist_ok=True,
             )
             paddle.save(
-                obj=state, path=f"{cfg.train_output_path}/pd/{cfg.model_name}.pdparams"
+                obj=state, path=f"{cfg.train_output_path}/pd/latest.pdparams"
             )
             logging.info(
-                f"Save checkpoint to: {cfg.train_output_path}/pd/{cfg.model_name}.pdparams"
+                f"Save checkpoint to: {cfg.train_output_path}/pd/latest.pdparams"
             )
-            max_loss_case_id, coefficent_json_dict = evaluate_on_fly(ep)
-
-        if paddle.distributed.get_rank() == 0:
-            train_json_dict["max_loss_case_id"] = max_loss_case_id
-            append_dict_to_json_list(train_json_file_path, train_json_dict)
-
-        if paddle.distributed.get_rank() == 0:
-            if isinstance(coefficent_json_dict, dict):
-                create_json(coefficent_json_file_path)
-                append_dict_to_json_list(
-                    coefficent_json_file_path, coefficent_json_dict
+            max_loss_case_id, min_loss_case_id, total_error = evaluate_on_fly(ep)
+            if total_error < best_error:
+                best_error = total_error
+                os.makedirs(
+                    os.path.dirname(
+                        f"{cfg.train_output_path}/pd/best.pdparams"
+                    ),
+                    exist_ok=True,
                 )
-            if isinstance(coefficent_json_dict, list):
-                create_json(coefficent_json_file_path)
-                for coefficent_json_dict_ in coefficent_json_dict:
-                    append_dict_to_json_list(
-                        coefficent_json_file_path, coefficent_json_dict_
-                    )
+                paddle.save(
+                    obj=state, path=f"{cfg.train_output_path}/pd/best.pdparams"
+                )
+                logging.info(
+                    f"Save checkpoint to: {cfg.train_output_path}/pd/best.pdparams"
+                )
+
+
+        if paddle.distributed.get_rank() == 0:
+            max_min_loss_dict = {"max_loss_case_id": max_loss_case_id, "min_loss_case_id": min_loss_case_id}
+            append_dict_to_json_list(train_json_file_path, train_json_dict)
+            append_dict_to_json_list(os.path.join(cfg.train_output_path, "json", "radius.json"), max_min_loss_dict)
 
 
 def save_eval_results(
@@ -597,9 +698,10 @@ def save_eval_results(
         array_hstack = np.hstack((centroid, v.T))
         csv_filename = os.path.join(
             output_dir,
-            "csv",
+            "csv_vtp",
             str(epoch_id),
-            str(caseid),
+            f"{str(caseid)[:20]}",
+            f"{str(caseid)[21:]}",
             f"{k}.csv",
         )
         os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
@@ -608,9 +710,10 @@ def save_eval_results(
 
         vtp_filename = os.path.join(
             output_dir,
-            "vtp",
+            "csv_vtp",
             str(epoch_id),
-            str(caseid),
+            f"{str(caseid)[:20]}",
+            f"{str(caseid)[21:]}",
             f"{k}.vtp",
         )
         os.makedirs(os.path.dirname(vtp_filename), exist_ok=True)

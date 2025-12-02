@@ -16,6 +16,7 @@ import pymeshlab
 from omegaconf import DictConfig
 from stl import mesh
 import json
+import math
 
 
 class CFDDataTransiton:
@@ -24,7 +25,7 @@ class CFDDataTransiton:
         self.inward_surface_normal = None
         self.cell_area = None
         self.csv_data = pd.read_csv(
-            os.path.join(case_path, f"{caseID[5:]}.csv")
+            os.path.join(case_path, f"{caseID}.csv")
         ).to_numpy()
         self.centroid = self.csv_data[:, -3:]
         self.press = self.csv_data[:, 0]
@@ -33,8 +34,9 @@ class CFDDataTransiton:
         self.flow_direction = np.array([-1, 0, 0])
         self.lift_direction = np.array([0, 0, 1])
         self.info = info
-        self.velocity = self.info["velocity"]
-        self.reference_area = self.info["reference_area"]
+
+        self.velocity = math.sqrt(self.info["car_speed"]**2 + self.info["wind_speed"]**2)
+        self.reference_area = self.info["area"]
         self.density = self.info["density"]
         self.const = 2.0 / (
             self.density * self.velocity**2 * self.reference_area
@@ -48,7 +50,7 @@ class CFDDataTransiton:
         try:
             self.cell_area = np.sqrt(np.sum(self.cell_area_ijk**2, axis=1))
         except TypeError:
-            logging.info(f"Aera type, {self.caseID} skipped.")
+            logging.info(f"Area type, {self.caseID} skipped.")
         return self.cell_area
 
     @property
@@ -113,31 +115,31 @@ class CFDDataTransiton:
     def save_values(self):
         os.makedirs(self.save_path, exist_ok=True)
         np.save(
-            os.path.join(self.save_path, f"pressure_{self.caseID[:4].zfill(4)}.npy"),
+            os.path.join(self.save_path, f"pressure_{self.caseID}.npy"),
             self.press,
         )
         np.save(
             os.path.join(
-                self.save_path, f"wallshearstress_{self.caseID[:4].zfill(4)}.npy"
+                self.save_path, f"wallshearstress_{self.caseID}.npy"
             ),
             self.wallshearstress,
         )
         np.save(
-            os.path.join(self.save_path, f"centroid_{self.caseID[:4].zfill(4)}.npy"),
+            os.path.join(self.save_path, f"centroid_{self.caseID}.npy"),
             self.centroid,
         )
         np.save(
-            os.path.join(self.save_path, f"area_{self.caseID[:4].zfill(4)}.npy"),
+            os.path.join(self.save_path, f"area_{self.caseID}.npy"),
             self.area,
         )
         np.save(
-            os.path.join(self.save_path, f"normal_{self.caseID[:4].zfill(4)}.npy"),
+            os.path.join(self.save_path, f"normal_{self.caseID}.npy"),
             self.normal,
         )
         paddle.save(
             obj=self.info,
             path=os.path.join(
-                self.save_path, f"info_{self.caseID[:4].zfill(4)}.pdparams"
+                self.save_path, f"info_{self.caseID}.pdparams"
             ),
         )
         return None
@@ -185,7 +187,7 @@ class MeshFormatTransition:
         logging.info(stl_mesh)
         stl_mesh.compute_vertex_normals()
         o3d.io.write_triangle_mesh(
-            self.save_path + f"/mesh_{self.caseID[:4].zfill(4)}.ply", stl_mesh
+            self.save_path + f"/mesh_{self.caseID}.ply", stl_mesh
         )
 
 
@@ -213,7 +215,7 @@ class ComputeDF:
         return query_points
 
     def compute_df_from_mesh(self):
-        stl_mesh = o3d.io.read_triangle_mesh(self.case_path + f"/{self.caseID[5:]}.stl")
+        stl_mesh = o3d.io.read_triangle_mesh(self.case_path + f"/{self.caseID}.stl")
         stl_mesh = o3d.t.geometry.TriangleMesh.from_legacy(stl_mesh)
         scene = o3d.t.geometry.RaycastingScene()
         _ = scene.add_triangles(stl_mesh)
@@ -232,7 +234,7 @@ class ComputeDF:
         pcd_query_points = o3d.geometry.PointCloud()
         pcd_query_points.points = query_points
         train_point = np.load(
-            os.path.join(self.case_path, f"centroid_{self.caseID[:4].zfill(4)}.npy")
+            os.path.join(self.case_path, f"centroid_{self.caseID}.npy")
         )
         train_point = o3d.utility.Vector3dVector(train_point)
         pcd_train = o3d.geometry.PointCloud()
@@ -253,7 +255,7 @@ class ComputeDF:
         else:
             raise "Not supported geometry source. Only Mesh or PCD supported."
         np.save(
-            os.path.join(self.save_path, f"df_{self.caseID[:4].zfill(4)}.npy"),
+            os.path.join(self.save_path, f"df_{self.caseID}.npy"),
             df_dict["df"],
         )
 
@@ -262,7 +264,7 @@ def compute_save_bounds_all(dataset_path, save_path, info):
     os.makedirs(save_path, exist_ok=True)
     included_num = 0
     logging.info("Computing bounds...")
-    caseIDs = [
+    sfeIDs = [
         d
         for d in os.listdir(dataset_path)
         if os.path.isdir(os.path.join(dataset_path, d))
@@ -271,38 +273,44 @@ def compute_save_bounds_all(dataset_path, save_path, info):
     global_bounds_all = []
     p_all = []
     wss_all = []
-    for caseID in caseIDs:
-        case_path = os.path.join(dataset_path, caseID)
-        data_trans = CFDDataTransiton(case_path, save_path, caseID, info)
+    for sfeID in sfeIDs:
+        caseIDs = [
+            d
+            for d in os.listdir(os.path.join(dataset_path, sfeID))
+            if os.path.isdir(os.path.join(dataset_path, sfeID, d))
+        ]
+        for caseID in caseIDs:
+            case_path = os.path.join(dataset_path, sfeID, caseID)
+            data_trans = CFDDataTransiton(case_path, save_path, sfeID+'-'+caseID, info)
 
-        csv_data = data_trans.csv_data
+            csv_data = data_trans.csv_data
 
-        max_value = np.amax(csv_data)
-        min_value = np.amin(csv_data)
-        if max_value > 1e10:
-            logging.info(f'Abnormal cfd case detected, skip {caseID} sample.')
-            continue
+            max_value = np.amax(csv_data)
+            min_value = np.amin(csv_data)
+            if max_value > 1e10:
+                logging.info(f'Abnormal cfd case detected, skip {caseID} sample.')
+                continue
 
-        area = data_trans.area
-        if area is None:
-            continue
-        area_bounds_all.append(
-            [
-                np.expand_dims(np.min(data_trans.cell_area), axis=0),
-                np.expand_dims(np.max(data_trans.cell_area), axis=0),
-            ]
-        )
-        global_bounds_all.append(
-            [
-                np.expand_dims(np.min(data_trans.centroid, axis=0), axis=0),
-                np.expand_dims(np.max(data_trans.centroid, axis=0), axis=0),
-            ]
-        )
-        p_all.append(data_trans.press)
-        wss_all.append(data_trans.wallshearstress)
-        logging.info(f"{caseID} included.")
-        included_num += 1
-    logging.info(f"{included_num}/{len(caseIDs)} cases included")
+            area = data_trans.area
+            if area is None:
+                continue
+            area_bounds_all.append(
+                [
+                    np.expand_dims(np.min(data_trans.cell_area), axis=0),
+                    np.expand_dims(np.max(data_trans.cell_area), axis=0),
+                ]
+            )
+            global_bounds_all.append(
+                [
+                    np.expand_dims(np.min(data_trans.centroid, axis=0), axis=0),
+                    np.expand_dims(np.max(data_trans.centroid, axis=0), axis=0),
+                ]
+            )
+            p_all.append(data_trans.press)
+            wss_all.append(data_trans.wallshearstress)
+            logging.info(f"{sfeID+'-'+caseID} included.")
+            included_num += 1
+    logging.info(f"{included_num}/{len(caseIDs)*len(sfeIDs)} cases included")
 
     area_bounds_all = [np.concatenate(column) for column in zip(*area_bounds_all)]
     global_bounds_all = [
@@ -377,7 +385,7 @@ def auto_trans(case_path, save_path, caseID, info):
 
 
 def extract_number(s):
-    s = s[:4]
+    s = s[17:20]+s[25:]
     ids = re.findall("\\d+", s)
     return int(ids[0])
 
@@ -395,26 +403,24 @@ def main(cfg: DictConfig):
 
         dataset_path = cfg.pre_input_path
         save_path = cfg.pre_output_path
-        caseIDs = [
+        sfeIDs = [
             d
             for d in os.listdir(dataset_path)
             if os.path.isdir(os.path.join(dataset_path, d))
         ]
+        caseIDs = []
+        for sfeID in sfeIDs:
+            for caseID in os.listdir(os.path.join(dataset_path, sfeID)):
+                caseIDs.append(sfeID+'-'+caseID)
         caseIDs.sort(key=extract_number)
         logging.info(f"number of caseIDs: {len(caseIDs)}")
 
         default_info = {
-            "length": 0,
-            "width": 0,
-            "height": 0,
-            "clearance": 0,
-            "slant": 0,
-            "radius": 0,
-            "velocity": 30.0,
-            "re": 0,
-            "reference_area": 0.1,
-            "density": 1.05,
-            "compute_normal": False,
+            "wind_angle":4,
+            "car_speed": 64.84166326688857,
+            "wind_speed": 4.534170793368145,
+            "area": 0.15625,
+            "density": 1.225
         }
 
         compute_save_bounds_all(dataset_path, save_path, default_info)
@@ -427,9 +433,9 @@ def main(cfg: DictConfig):
                 force=True,
             )
             logging.info(f"Preprocessing caseID: {caseID}")
-            case_path = os.path.join(dataset_path, caseID)
+            case_path = os.path.join(dataset_path, caseID[:20], caseID[21:])
 
-            json_file_path = os.path.join(case_path, caseID[5:] + ".json")
+            json_file_path = os.path.join(case_path, caseID + ".json")
             with open(json_file_path, 'r', encoding='utf-8') as file:
                 info = json.load(file)
 

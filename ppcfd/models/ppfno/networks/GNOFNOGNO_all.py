@@ -3,6 +3,7 @@ import sys
 
 import paddle
 import paddle.nn as nn
+import math
 
 from ..neuralop.models import FNO
 from .base_model import BaseModel
@@ -231,20 +232,77 @@ class GNOFNOGNO_all(GNOFNOGNO):
         )
         df = data_dict["df"]
         area = data_dict["areas"][0]
-        info_fields = data_dict["info"][0]["velocity"] * paddle.ones_like(x=df).to(
-            "float32"
-        )
-        df = paddle.concat(x=(df, info_fields), axis=0)
+
+        wind_angle = float(data_dict["info"][0]["wind_angle"])
+        velocity = math.sqrt(float(data_dict["info"][0]["wind_speed"]) ** 2 + float(data_dict["info"][0]["car_speed"]) ** 2)  
+        angle_field = wind_angle * paddle.ones_like(x=df).astype("float32")
+        speed_field = velocity * paddle.ones_like(x=df).astype("float32")
+    
+        df = paddle.concat(x=(df, angle_field, speed_field), axis=0)
         if self.use_adain:
-            vel = (
-                paddle.to_tensor(data=[data_dict["info"][0]["velocity"]])
-                .reshape((-1,))
-                .to("float32")
-            )
+            vel = paddle.to_tensor(data=[[wind_angle, velocity]], dtype="float32")
             vel_embed = self.adain_pos_embed(vel)
+            vel_embed = vel_embed.squeeze(0)  
             for norm in self.fno.fno_blocks.norm:
                 norm.update_embeddding(vel_embed)
+
+        # wind_angle = float(data_dict["info"][0]["wind_angle"])
+        # car_speed = float(data_dict["info"][0]["car_speed"])
+        # wind_speed = float(data_dict["info"][0]["wind_speed"])
+
+        # angle_field = wind_angle * paddle.ones_like(x=df).astype("float32")
+        # car_field = car_speed * paddle.ones_like(x=df).astype("float32")
+        # wind_field = wind_speed * paddle.ones_like(x=df).astype("float32")
+    
+        # df = paddle.concat(x=(df, angle_field, car_field, wind_field), axis=0)
+        # if self.use_adain:
+        #     vel = paddle.to_tensor(data=[[wind_angle, car_speed, wind_speed]], dtype="float32")
+        #     vel_embed = self.adain_pos_embed(vel)
+        #     vel_embed = vel_embed.squeeze(0)  
+        #     for norm in self.fno.fno_blocks.norm:
+        #         norm.update_embeddding(vel_embed)
         return x_in, x_out, df, area
+
+    def cal_F_M(self, data_dict, pred_decode, truth_decode, key="pressure"):
+        r0 = paddle.to_tensor([-3.125, 0.0, 0.0], dtype="float32")
+        triangle_normals = data_dict["triangle_normals"][0] 
+        areas = data_dict["areas"][0].reshape([-1, 1]) 
+        centroids = data_dict["centroids"][0]
+
+        if key == "pressure":
+            # 真值每三角形牵引力 (N,3)
+            traction_truth = -truth_decode.reshape([-1, 1]) * triangle_normals  # (N,3)
+            F_per_truth = traction_truth * areas            # (N,3)
+            # 预测每三角形牵引力 (N,3)
+            traction_pred = -pred_decode.reshape([-1, 1]) * triangle_normals
+            F_per_pred = traction_pred * areas 
+            # 合力
+            F_total_truth = F_per_truth.sum(axis=0)    # (3,)
+            F_total_pred = F_per_pred.sum(axis=0)   # (3,)
+
+            # 力矩（关于 r0）： sum( (r_i - r0) x F_i )
+            r_rel = (centroids - r0)  # (N,3)
+            M_per_truth = paddle.cross(r_rel, F_per_truth)  # (N,3)
+            M_per_pred = paddle.cross(r_rel, F_per_pred)
+            M_total_truth = M_per_truth.sum(axis=0)
+            M_total_pred = M_per_pred.sum(axis=0)
+        elif key == "wallshearstress":
+            traction_truth = truth_decode.T
+            F_per_truth = -traction_truth * areas
+
+            traction_pred = pred_decode.T
+            F_per_pred = -traction_pred * areas
+
+            F_total_truth = F_per_truth.sum(axis=0)
+            F_total_pred = F_per_pred.sum(axis=0)
+
+            r_rel = (centroids - r0)  # (N,3)
+            M_per_truth = paddle.cross(r_rel, F_per_truth)
+            M_per_pred = paddle.cross(r_rel, F_per_pred)
+            M_total_truth = M_per_truth.sum(axis=0)
+            M_total_pred = M_per_pred.sum(axis=0)
+        
+        return F_total_truth, F_total_pred, M_total_truth, M_total_pred
 
     @paddle.no_grad()
     def eval_dict(self, device, data_dict, loss_fn=None, decode_fn=None, **kwargs):
@@ -280,8 +338,10 @@ class GNOFNOGNO_all(GNOFNOGNO):
         if loss_fn is None:
             loss_fn = self.loss
         out_dict = {
-            "Cd_pred": paddle.to_tensor(data=0.0).cuda(blocking=True),
-            "Cd_truth": paddle.to_tensor(data=0.0).cuda(blocking=True),
+            "F_pred": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
+            "F_truth": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
+            "M_pred": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
+            "M_truth": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
         }
         truth = []
         for i in range(len(self.out_keys)):
@@ -301,44 +361,42 @@ class GNOFNOGNO_all(GNOFNOGNO):
             if decode_fn is not None:
                 pred_decode = decode_fn(pred_key, i)
                 truth_decode = decode_fn(truth_key, i)
-
-                if key == "pressure":
-                    drag_weight = data_dict["dragWeight"][0].cuda(blocking=True)
-                    # drag_weight = drag_weight * 10e10
-                    drag_weight = drag_weight[:: self.subsample_eval]
-                    drag_pred = paddle.sum(x=drag_weight * pred_decode) * 1e-10
-                    drag_truth = paddle.sum(x=drag_weight * truth_decode) * 1e-10
-                    drag_pred = paddle.abs(drag_pred)
-                    drag_truth = paddle.abs(drag_truth)
-                elif key == "wallshearstress":
-                    drag_weight = data_dict["dragWeightWss"][0][
-                        : self.out_channels[i], :
-                    ].cuda(blocking=True)
-                    drag_weight = drag_weight[..., :: self.subsample_eval]
-                    drag_pred = paddle.sum(x=drag_weight * pred_decode)
-                    drag_truth = paddle.sum(x=drag_weight * truth_decode)
+                
+                F_total_truth, F_total_pred, M_total_truth, M_total_pred = self.cal_F_M(
+                    data_dict, pred_decode, truth_decode, key=key)
 
                 out_dict.update(
-                    {f"Cd_{key}_pred": drag_pred, f"Cd_{key}_truth": drag_truth}
+                    {
+                        f"F_{key}_pred": F_total_pred,
+                        f"F_{key}_truth": F_total_truth,
+                        f"M_{key}_pred": M_total_pred,
+                        f"M_{key}_truth": M_total_truth,
+                    }
                 )
-                out_dict["Cd_pred"] += drag_pred
-                out_dict["Cd_truth"] += drag_truth
+                out_dict["F_pred"] += F_total_pred
+                out_dict["F_truth"] += F_total_truth
+                out_dict["M_pred"] += M_total_pred
+                out_dict["M_truth"] += M_total_truth
+
         truth = paddle.concat(x=truth, axis=0)
+        F_M_dict = {}
+        F_M_dict.update({"F_pred": out_dict["F_pred"]})
+        F_M_dict.update({"F_truth": out_dict["F_truth"]})
+        F_M_dict.update({"M_pred": out_dict["M_pred"]})
+        F_M_dict.update({"M_truth": out_dict["M_truth"]})
+        F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
+        F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
+        F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
+        F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
+        F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
+        F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
+        F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
+        F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
+        F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
+        F_M_dict.update({"L2_pressure": out_dict["L2_pressure"]})
+        F_M_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
 
-        cd_dict = {}
-        cd_dict.update({"Cd_pred": out_dict["Cd_pred"]})
-        cd_dict.update({"Cd_truth": out_dict["Cd_truth"]})
-        cd_dict.update({"Cd_pressure_pred": out_dict["Cd_pressure_pred"]})
-        cd_dict.update({"Cd_pressure_truth": out_dict["Cd_pressure_truth"]})
-        cd_dict.update({"Cd_wallshearstress_pred": out_dict["Cd_wallshearstress_pred"]})
-        cd_dict.update(
-            {"Cd_wallshearstress_truth": out_dict["Cd_wallshearstress_truth"]}
-        )
-        cd_dict = self.integral_cd(cd_dict, self.out_keys)
-        cd_dict.update({"L2_pressure": out_dict["L2_pressure"]})
-        cd_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
-
-        return out_dict, pred, truth, cd_dict
+        return out_dict, pred, truth, F_M_dict
 
     @paddle.no_grad()
     def inference_dict(self, device, data_dict, loss_fn=None, decode_fn=None, **kwargs):
@@ -376,7 +434,10 @@ class GNOFNOGNO_all(GNOFNOGNO):
         pred = pred.transpose(perm=[1, 0])
         if loss_fn is None:
             loss_fn = self.loss
-        out_dict = {"Cd_pred": paddle.to_tensor(data=0.0).cuda(blocking=True)}
+        out_dict = {
+            "F_pred": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
+            "M_pred": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
+        }
 
         for i in range(len(self.out_keys)):
             key = self.out_keys[i]
@@ -389,57 +450,47 @@ class GNOFNOGNO_all(GNOFNOGNO):
             pred_key = pred[st:end, :]
             if decode_fn is not None:
                 pred_decode = decode_fn(pred_key, i)
+                r0 = paddle.to_tensor([-3.125, 0.0, 0.0], dtype="float32")
+                triangle_normals = data_dict["triangle_normals"][0] 
+                areas = data_dict["areas"][0].reshape([-1, 1]) 
+                centroids = data_dict["centroids"][0]
                 
                 if key == "pressure":
-                    drag_weight = data_dict["dragWeight"][0].cuda(blocking=True)
-                    # drag_weight = drag_weight * 10e10
-                    drag_weight = drag_weight[:: self.subsample_eval]
-                    drag_pred = paddle.sum(x=drag_weight * pred_decode) * 1e-10
-                    drag_pred = paddle.abs(drag_pred)
+                    traction_pred = -pred_decode.reshape([-1, 1]) * triangle_normals
+                    F_per_pred = traction_pred * areas 
+                    F_total_pred = F_per_pred.sum(axis=0)   # (3,)
+                    # 力矩（关于 r0）： sum( (r_i - r0) x F_i )
+                    r_rel = (centroids - r0)  # (N,3)
+                    M_per_pred = paddle.cross(r_rel, F_per_pred)
+                    M_total_pred = M_per_pred.sum(axis=0)
                 elif key == "wallshearstress":
-                    drag_weight = data_dict["dragWeightWss"][0][
-                        : self.out_channels[i], :
-                    ].cuda(blocking=True)
-                    drag_weight = drag_weight[..., :: self.subsample_eval]
-                    drag_pred = paddle.sum(x=drag_weight * pred_decode)
+                    traction_pred = pred_decode.T
+                    F_per_pred = -traction_pred * areas
+                    F_total_pred = F_per_pred.sum(axis=0)
 
-                out_dict.update({f"Cd_{key}_pred": drag_pred})
-                out_dict["Cd_pred"] += drag_pred
+                    r_rel = (centroids - r0)  # (N,3)
+                    M_per_pred = paddle.cross(r_rel, F_per_pred)
+                    M_total_pred = M_per_pred.sum(axis=0)
 
-        cd_dict = {}
-        cd_dict.update({"Cd_pred": out_dict["Cd_pred"].item()})
-        cd_dict.update({"Cd_pressure_pred": out_dict["Cd_pressure_pred"].item()})
-        cd_dict.update(
-            {"Cd_wallshearstress_pred": out_dict["Cd_wallshearstress_pred"].item()}
-        )
-        cd_dict = self.integral_cd(cd_dict, self.out_keys)
-
-        velocity = data_dict["info"][0]["velocity"]
-        reference_area = data_dict["info"][0]["reference_area"]
-        density = data_dict["info"][0]["density"]
-        const = 0.5 * density * velocity**2 * reference_area
-
-        cd_dict.update({"total_drag_pred": const * cd_dict["Cd_pred_modify"].item()})
-
-        cd_dict.update(
-            {
-                "pressure_drag_pred": const
-                * (
-                    cd_dict["Cd_pressure_pred"]
-                    + cd_dict["Cd_pred_modify"].item()
-                    - out_dict["Cd_pred"].item()
+                out_dict.update(
+                    {
+                        f"F_{key}_pred": F_total_pred,
+                        f"M_{key}_pred": M_total_pred,
+                    }
                 )
-            }
-        )
+                out_dict["F_pred"] += F_total_pred
+                out_dict["M_pred"] += M_total_pred
 
-        cd_dict.update(
-            {
-                "wallshearstress_drag_pred": const
-                * out_dict["Cd_wallshearstress_pred"].item()
-            }
-        )
+        F_M_dict = {}
+        F_M_dict.update({"F_pred": out_dict["F_pred"]})
+        F_M_dict.update({"M_pred": out_dict["M_pred"]})
+        F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
+        F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
+        F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
+        F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
+        F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
 
-        return out_dict, pred, cd_dict
+        return out_dict, pred, F_M_dict
 
     def forward(
         self,
@@ -478,45 +529,83 @@ class GNOFNOGNO_all(GNOFNOGNO):
             pred = truth
             # paddle.device.cuda.empty_cache()  # clear GPU memory
 
-        cd_dict = {}
+        F_M_dict = {}
         if self.integral_cd.parameters()[0].stop_gradient == False:
             # cd_dict = self.integral_cd(pred, truth, self.out_channels,
             #    data_dict, decode_fn=decode_fn,
             #    out_keys=self.out_keys,
             #    subsample_train=self.subsample_train)
 
-            cd_dict.update({"OOM": False})
+            F_M_dict.update({"OOM": False})
             try:
                 out_dict, _, _, _ = self.eval_dict(
                     device, data_dict, loss_fn=loss_fn, decode_fn=decode_fn
                 )
 
-                cd_dict.update({"Cd_pred": out_dict["Cd_pred"]})
-                cd_dict.update({"Cd_truth": out_dict["Cd_truth"]})
-                cd_dict.update({"Cd_pressure_pred": out_dict["Cd_pressure_pred"]})
-                cd_dict.update({"Cd_pressure_truth": out_dict["Cd_pressure_truth"]})
-                cd_dict.update(
-                    {"Cd_wallshearstress_pred": out_dict["Cd_wallshearstress_pred"]}
-                )
-                cd_dict.update(
-                    {"Cd_wallshearstress_truth": out_dict["Cd_wallshearstress_truth"]}
-                )
-                cd_dict = self.integral_cd(cd_dict, self.out_keys)
-                cd_dict.update({"L2_pressure": out_dict["L2_pressure"]})
-                cd_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
-
-                def cal_mre(pred, label):
-                    return paddle.abs(x=pred - label) / paddle.abs(x=label)
-
-                # print(f'sample {idx_batch} cd_dict:', cd_dict)
+                F_M_dict.update({"F_pred": out_dict["F_pred"]})
+                F_M_dict.update({"F_truth": out_dict["F_truth"]})
+                F_M_dict.update({"M_pred": out_dict["M_pred"]})
+                F_M_dict.update({"M_truth": out_dict["M_truth"]})
+                F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
+                F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
+                F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
+                F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
+                F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
+                F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
+                F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
+                F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
+                F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
+                F_M_dict.update({"L2_pressure": out_dict["L2_pressure"]})
+                F_M_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
 
             except MemoryError as e:
                 if "Out of memory" in str(e):
                     print(f"WARNING: OOM on sample {idx_batch}, skipping this sample.")
                     if hasattr(paddle.device.cuda, "empty_cache"):
                         paddle.device.cuda.empty_cache()
-                    cd_dict.update({"OOM": True})
+                    F_M_dict.update({"OOM": True})
                 else:
                     raise
 
-        return pred.transpose(perm=[1, 0]), truth.transpose(perm=[1, 0]), cd_dict
+        # else:
+
+        #     pred_decode = pred.transpose(perm=[1, 0])
+        #     truth_decode = truth.transpose(perm=[1, 0])
+        #     F_total_truth_p, F_total_pred_p, M_total_truth_p, M_total_pred_p = self.cal_F_M(
+        #             data_dict, pred_decode[0], truth_decode[0], key='pressure')
+
+        #     F_total_truth_wss, F_total_pred_wss, M_total_truth_wss, M_total_pred_wss = self.cal_F_M(
+        #             data_dict, pred_decode[1:], truth_decode[1:], key='wallshearstress')
+        #     out_dict = {}
+        #     out_dict.update(
+        #         {
+        #             "F_pressure_pred": F_total_pred_p,
+        #             "F_pressure_truth": F_total_truth_p,
+        #             "M_pressure_pred": M_total_pred_p,
+        #             "M_pressure_truth": M_total_truth_p,
+        #             "F_wallshearstress_pred": F_total_pred_wss,
+        #             "F_wallshearstress_truth": F_total_truth_wss,
+        #             "M_wallshearstress_pred": M_total_pred_wss,
+        #             "M_wallshearstress_truth": M_total_truth_wss,
+        #             "F_pred": F_total_pred_p + F_total_pred_wss,
+        #             "F_truth": F_total_truth_p + F_total_truth_wss,
+        #             "M_pred": M_total_pred_p + M_total_pred_wss,
+        #             "M_truth": M_total_truth_p + M_total_truth_wss,
+        #         }
+        #     )
+
+        #     F_M_dict.update({"F_pred": out_dict["F_pred"]})
+        #     F_M_dict.update({"F_truth": out_dict["F_truth"]})
+        #     F_M_dict.update({"M_pred": out_dict["M_pred"]})
+        #     F_M_dict.update({"M_truth": out_dict["M_truth"]})
+        #     F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
+        #     F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
+        #     F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
+        #     F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
+        #     F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
+        #     F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
+        #     F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
+        #     F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
+        #     F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
+
+        return pred.transpose(perm=[1, 0]), truth.transpose(perm=[1, 0]), F_M_dict

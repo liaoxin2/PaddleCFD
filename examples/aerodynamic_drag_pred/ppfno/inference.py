@@ -14,6 +14,7 @@ import numpy as np
 import paddle
 import pyvista as pv
 import vtk
+import math
 from omegaconf import DictConfig
 from paddle import distributed as dist
 from paddle.distributed import ParallelEnv
@@ -114,7 +115,7 @@ def inference(cfg: DictConfig):
 
     # init logger
     logging.basicConfig(
-        filename=os.path.join(cfg.reason_output_path, "log", f"{cfg.mode}.log"),
+        filename=os.path.join(cfg.reason_output_path, "log", "reason.log"),
         level=logging.INFO,
         format="%(asctime)s:%(levelname)s: %(message)s",
         force=True,
@@ -185,64 +186,94 @@ def inference(cfg: DictConfig):
         return paddle.abs(x=pred - label) / paddle.abs(x=label)
 
     for i, data_dict in enumerate(inference_dataloader):
-        inference_json_dict = {}
-        device = ParallelEnv().device_id
-        device = paddle.CUDAPlace(device)
-        try:
-            t1 = default_timer()
-            out_dict, pred, cd_dict = model.inference_dict(
-                device, data_dict, loss_fn=loss_fn, decode_fn=datamodule.decode
-            )
-            t2 = default_timer()
-            logging.info(f"Inference {i} costs: {t2 - t1:.2f} seconds.")
-            # print('cd_dict:', cd_dict)
-            if cfg.save_eval_results:
-                save_eval_results(
-                    cfg,
-                    pred,
-                    datamodule.inference_indices[0],
-                    datamodule.inference_full_caseids[0],
-                    decode_fn=datamodule.decode,
-                )
-            # paddle.device.cuda.empty_cache()
-        except MemoryError as e:
-            if "Out of memory" in str(e):
-                logging.info(f"WARNING: OOM on sample {i}, skipping this sample.")
-                if hasattr(paddle.device.cuda, "empty_cache"):
-                    paddle.device.cuda.empty_cache()
-                continue
+        if ',' in data_dict['info'][0]['wind_speed']:
+            value_list = [float(wind_speed) for wind_speed in data_dict['info'][0]['wind_speed'].split(',')]
+        else:
+            value_list = [float(wind_angle) for wind_angle in data_dict['info'][0]['wind_angle'].split(',')]
+
+        for value in value_list:
+            inference_json_dict = {}
+            if ',' in data_dict['info'][0]['wind_speed']:
+                data_dict['info'][0]['wind_speed'] = value
+                inference_json_dict['type'] = 'wind_speed'
             else:
-                raise
-        msg = f"Eval sample {i}... L2_Error: "
-        for k, v in out_dict.items():
-            if k.split("_")[0] == "L2":
-                msg += f"{k}: {v.item():.4f}, "
-                eval_meter.update({k: v})
-        msg += f"|| MRE and Value: "
+                data_dict['info'][0]['wind_angle'] = value
+                inference_json_dict['type'] = 'wind_angle'
 
-        Cd_pred_modify = cd_dict["Cd_pred_modify"]
-        Cd_pred = out_dict["Cd_pred"].item()
-        eval_meter.update({"Cd_pred_modify": Cd_pred_modify})
-        msg += f"[Cd_pred_modify: {Cd_pred_modify.item():.4f}, "
+            
+            device = ParallelEnv().device_id
+            device = paddle.CUDAPlace(device)
+            try:
+                t1 = default_timer()
+                out_dict, pred, F_M_dict = model.inference_dict(
+                    device, data_dict, loss_fn=loss_fn, decode_fn=datamodule.decode
+                )
+                t2 = default_timer()
+                logging.info(f"Inference {i} costs: {t2 - t1:.2f} seconds.")
+                # print('cd_dict:', cd_dict)
+                if cfg.save_eval_results:
+                    save_eval_results(
+                        cfg,
+                        pred,
+                        value,
+                        datamodule.inference_indices[0],
+                        datamodule.inference_full_caseids[0],
+                        decode_fn=datamodule.decode,
+                    )
+                # paddle.device.cuda.empty_cache()
+            except MemoryError as e:
+                if "Out of memory" in str(e):
+                    logging.info(f"WARNING: OOM on sample {i}, skipping this sample.")
+                    if hasattr(paddle.device.cuda, "empty_cache"):
+                        paddle.device.cuda.empty_cache()
+                    continue
+                else:
+                    raise
+            msg = f"Eval sample {i}... L2_Error: "
+            for k, v in out_dict.items():
+                if k.split("_")[0] == "L2":
+                    msg += f"{k}: {v.item():.4f}, "
+                    eval_meter.update({k: v})
+            msg += f"|| MRE and Value: "
 
-        inference_json_dict["Cd_pred"] = Cd_pred_modify.item()
-        inference_json_dict["Cd_pressure_pred"] = (
-            cd_dict["Cd_pressure_pred"]
-            + cd_dict["Cd_pred_modify"].item()
-            - out_dict["Cd_pred"].item()
-        )
+            F_pred_modify = F_M_dict["F_pred_modify"]
+            M_pred_modify = F_M_dict["M_pred_modify"]
+            F_pred = out_dict["F_pred"]
+            M_pred = out_dict["M_pred"]
+            eval_meter.update({"F_pred_modify": F_pred_modify})
+            eval_meter.update({"M_pred_modify": M_pred_modify})
+            msg += f"F_pred_modify: {F_pred_modify.numpy()}, "
+            msg += f"M_pred_modify: {M_pred_modify.numpy()}, "
 
-        inference_json_dict["Cd_wallshearstress_pred"] = cd_dict[
-            "Cd_wallshearstress_pred"
-        ]
-        inference_json_dict["total_drag_pred"] = cd_dict["total_drag_pred"]
-        inference_json_dict["pressure_drag_pred"] = cd_dict["pressure_drag_pred"]
-        inference_json_dict["wallshearstress_drag_pred"] = cd_dict[
-            "wallshearstress_drag_pred"
-        ]
-        append_dict_to_json_list(inference_json_file_path, inference_json_dict)
 
-        logging.info(msg)
+            load_types = {
+                'aerodynamic_lift': {'pred': F_M_dict['F_pred'][1]},
+                'aerodynamic_drag': {'pred': F_M_dict['F_pred'][0]},
+                'pneumatic_lateral_force': {'pred': F_M_dict['F_pred'][2]},
+                'pneumatic_overturning_moment': {'pred': F_M_dict['M_pred'][0]},
+                'pneumatic_pitching_moment': {'pred': F_M_dict['M_pred'][1]},
+                'pneumatic_roll_moment': {'pred': F_M_dict['M_pred'][2]},
+            }
+
+            inference_json_dict['car_speed'] = data_dict["info"][0]["car_speed"]
+            inference_json_dict['wind_speed'] = data_dict["info"][0]["wind_speed"]
+            inference_json_dict['wind_angle'] = data_dict["info"][0]["wind_angle"]
+
+            mass_density = float(data_dict["info"][0]["density"])
+            reference_area = float(data_dict["info"][0]["area"])
+            flow_speed = math.sqrt(float(data_dict["info"][0]["car_speed"])**2 + float(data_dict["info"][0]["wind_speed"])**2)
+            const = 2.0 / (mass_density * flow_speed**2 * reference_area)
+
+            for load_name, values in load_types.items():
+                cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
+                inference_json_dict[load_name] = {
+                    'cal_value': float(cal_val),
+                    'coefficient': float(cal_val)*const,
+                }
+
+            append_dict_to_json_list(inference_json_file_path, inference_json_dict)
+
+            logging.info(msg)
 
     t3 = default_timer()
     msg = (
@@ -250,7 +281,7 @@ def inference(cfg: DictConfig):
     )
     eval_dict = eval_meter.avg
     for k, v in eval_dict.items():
-        msg += f"{v.item():.4f}({k}), "
+        msg += f"{v}({k}), "
     logging.info(msg)
     max_memory_allocated = paddle.device.cuda.max_memory_allocated(device=device) / (
         1024 * 1024 * 1024
@@ -259,13 +290,13 @@ def inference(cfg: DictConfig):
 
 
 def save_eval_results(
-    cfg: DictConfig, pred, centroid_idx, caseid, decode_fn=None
+    cfg: DictConfig, pred, value, centroid_idx, caseid, decode_fn=None
 ) -> Tuple[str, str, str]:
     pred_pressure = decode_fn(pred[0:1, :], 0).cpu().detach().numpy()
     pred_wallshearstress = decode_fn(pred[1:4, :], 1).cpu().detach().numpy()
     evals_results = {
-        "pred_pressure": pred_pressure,
-        "pred_wallshearstress": pred_wallshearstress,
+        "cal_pressure_drag": pred_pressure,
+        "cal_friction_resistance": pred_wallshearstress,
     }
     centroid = np.load(f"{cfg.reason_input_path}/centroid_{centroid_idx}.npy")
 
@@ -273,7 +304,7 @@ def save_eval_results(
 
     cells = [("vertex", np.arange(tuple(centroid.shape)[0]).reshape(-1, 1))]
 
-    os.makedirs(os.path.join(cfg.reason_output_path, "vtp_csv"), exist_ok=True)
+    os.makedirs(os.path.join(cfg.reason_output_path, "csv_vtp", str(int(value))), exist_ok=True)
 
     pred_pressure_csv_path = None
     pred_pressure_vtp_path = None
@@ -285,14 +316,16 @@ def save_eval_results(
         array_hstack = np.hstack((centroid, v.T))
         csv_filename = os.path.join(
             cfg.reason_output_path,
-            "vtp_csv",
-            f"{caseid}_{k}.csv",
+            "csv_vtp",
+            f"{int(value)}",
+            f"{k}.csv",
         )
         np.savetxt(csv_filename, array_hstack, delimiter=",", fmt="%f")
         vtp_filename = os.path.join(
             cfg.reason_output_path,
-            "vtp_csv",
-            f"{caseid}_{k}.vtp",
+            "csv_vtp",
+            f"{int(value)}", 
+            f"{k}.vtp",
         )
         if v.T.shape[1] == 1:
             save_vtp_from_dict(

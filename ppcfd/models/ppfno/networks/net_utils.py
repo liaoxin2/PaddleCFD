@@ -35,6 +35,8 @@ class PositionalEmbedding(paddle.nn.Layer):
         self.endpoint = endpoint
 
     def forward(self, x):
+        if len(x.shape) > 1 and x.shape[1] > 1:
+            x = paddle.norm(x, p=2, axis=1, keepdim=True) 
         freqs = paddle.arange(start=0, end=self.num_channels // 2, dtype='float32')
         freqs = freqs / (self.num_channels // 2 - (1 if self.endpoint else 0))
         freqs = (1 / self.max_positions) ** freqs

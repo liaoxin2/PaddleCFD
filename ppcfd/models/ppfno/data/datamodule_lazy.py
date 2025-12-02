@@ -15,6 +15,7 @@ import meshio
 import numpy as np
 import open3d as o3d
 import paddle
+import math
 
 from .base_datamodule import BaseDataModule
 
@@ -212,39 +213,40 @@ class PathDictDataset(paddle.io.Dataset, LoadMesh, LoadFile):
             if self.closest_points_to_query:
                 return_dict["closest_points"] = closest_points
         return_dict["df_query_points"] = paddle.to_tensor(data=self.query_points)
-        if not return_dict["info"]["compute_normal"]:
-            return_dict["vertices"] = None
-            reference_area = return_dict["info"]["reference_area"]
-            areas = self.load_file(f"area_{file_index}")
-            centroids = self.load_file(f"centroid_{file_index}")
-            triangle_normals = self.load_file(f"normal_{file_index}")
-            mesh_test_path = self.path / f"mesh_rec_{file_index}.ply"
-            if get_last_dir(self.path) == "test" and os.path.exists(mesh_test_path):
-                mesh = meshio.read(mesh_test_path)
-                return_dict["mesh"] = mesh
-        else:
-            mesh = self.load_mesh(self.index_to_mesh_path(file_index))
-            vertices = self.vertices_from_mesh(mesh)
-            triangles = self.triangles_from_mesh(mesh)
-            centroids, areas = self.get_triangle_centroids(vertices, triangles)
-            return_dict["vertices"] = vertices
-            mesh.compute_triangle_normals()
-            triangle_normals = paddle.to_tensor(
-                data=mesh.triangle_normals, dtype="float64"
-            ).reshape((-1, 3))
-            reference_area = (
-                return_dict["info"]["width"] * return_dict["info"]["height"] / 2 * 1e-06
-            )
+        #if not return_dict["info"]["compute_normal"]:
+        return_dict["vertices"] = None
+        reference_area = return_dict["info"]["area"]
+        areas = self.load_file(f"area_{file_index}")
+        centroids = self.load_file(f"centroid_{file_index}")
+        triangle_normals = self.load_file(f"normal_{file_index}")
+        return_dict["triangle_normals"] = triangle_normals
+        mesh_test_path = self.path / f"mesh_rec_{file_index}.ply"
+        if get_last_dir(self.path) == "test" and os.path.exists(mesh_test_path):
+            mesh = meshio.read(mesh_test_path)
+            return_dict["mesh"] = mesh
+        # else:
+        #     mesh = self.load_mesh(self.index_to_mesh_path(file_index))
+        #     vertices = self.vertices_from_mesh(mesh)
+        #     triangles = self.triangles_from_mesh(mesh)
+        #     centroids, areas = self.get_triangle_centroids(vertices, triangles)
+        #     return_dict["vertices"] = vertices
+        #     mesh.compute_triangle_normals()
+        #     triangle_normals = paddle.to_tensor(
+        #         data=mesh.triangle_normals, dtype="float64"
+        #     ).reshape((-1, 3))
+        #     reference_area = (
+        #         return_dict["info"]["width"] * return_dict["info"]["height"] / 2 * 1e-06
+        #     )
         flow_directions = paddle.zeros_like(x=triangle_normals)
         flow_directions[:, 0] = -1
         mass_density = return_dict["info"]["density"]
-        flow_speed = return_dict["info"]["velocity"]
+        flow_speed = math.sqrt(return_dict["info"]["car_speed"]**2 + return_dict["info"]["wind_speed"]**2)
         const = 2.0 / (mass_density * flow_speed**2 * reference_area)
         projection = paddle.sum(
             x=(triangle_normals  * 1e10) * flow_directions, axis=1, keepdim=False
         )
-        return_dict["dragWeight"] = const * projection * areas
-        return_dict["dragWeightWss"] = (const * flow_directions * areas[:, None]).T
+        return_dict["dragWeight"] =  projection * areas
+        return_dict["dragWeightWss"] = ( flow_directions * areas[:, None]).T
         return_dict["areas"] = areas
         return_dict["centroids"] = centroids
         for key in self.norms_dict:
@@ -432,7 +434,7 @@ class SAEDataModule(BaseCFDDataModule):
             all_files = os.listdir(self.data_dir)
             all_files = [file for file in all_files if file.endswith(".npy")]
             prefix = "area"
-            indices = [item[5:9] for item in all_files if item.startswith(prefix)]
+            indices = [item[5:-10] for item in all_files if item.startswith(prefix)]
 
             def extract_number(s):
                 return int(s)
@@ -440,11 +442,12 @@ class SAEDataModule(BaseCFDDataModule):
             def extract_number2(s):
                 return int(s[0:4])
 
-            indices.sort(key=extract_number)
+            indices.sort()
             indices = indices[:n_data]
+            indices = list(set(indices))
             full_caseids = os.listdir(self.data_dir)
             full_caseids = [d for d in full_caseids if os.path.isdir(os.path.join(self.data_dir, d))]
-            full_caseids.sort(key=extract_number2)
+            full_caseids.sort()
             full_caseids = full_caseids[:n_data]
             # print('indices_%s:' % mode, indices)
         return indices, full_caseids
@@ -468,7 +471,7 @@ class SAEDataModule(BaseCFDDataModule):
             self.train_indices, self.train_full_caseids = self.init_idx(n_train, "train", "train_design_ids.txt")
             self.test_indices, self.test_full_caseids = self.init_idx(n_test, "test", "test_design_ids.txt")
         else:
-            self.train_indices, self.train_full_caseids = self.init_idx(n_train, "train", "train_design_ids.txt")
+            self.train_indices, full_caseids = self.init_idx(n_train, "train", "train_design_ids.txt")
             index = list(range(len(self.train_indices)))
             train_index, test_index = self.split_list_(
                 index, train_ratio=self.train_ratio, test_ratio=self.test_ratio
@@ -477,10 +480,13 @@ class SAEDataModule(BaseCFDDataModule):
                 [self.train_indices[j] for j in train_index],
                 [self.train_indices[k] for k in test_index],
             )
-            self.train_full_caseids, self.test_full_caseids = (
-                [self.train_full_caseids[j] for j in train_index],
-                [self.train_full_caseids[k] for k in test_index],
-            )
+            self.train_full_caseids, self.test_full_caseids = [], []
+            for case in full_caseids:
+                if case[:-6] in self.train_indices:
+                    self.train_full_caseids.append(case)
+                else:
+                    self.test_full_caseids.append(case)
+            
             print(self.train_full_caseids, self.test_full_caseids)
 
     def get_norms(self, data_dir):
@@ -517,9 +523,9 @@ class SAEDataModule(BaseCFDDataModule):
         for i in range(len(self.out_keys)):
             key = self.out_keys[i]
             if key == "pressure":
-                file_path = data_dir / f"pressure_{self.train_indices[0]}.npy"
+                file_path = data_dir / f"pressure_{self.train_full_caseids[0]}.npy"
             elif key == "wallshearstress":
-                file_path = data_dir / f"wallshearstress_{self.train_indices[0]}.npy"
+                file_path = data_dir / f"wallshearstress_{self.train_full_caseids[0]}.npy"
             mean_std_filename = f"train_{key}_mean_std.txt"
             key_normalization = UnitGaussianNormalizer(
                 paddle.to_tensor(data=self.load_file(file_path)),
@@ -535,8 +541,8 @@ class SAEDataModule(BaseCFDDataModule):
             self.output_normalization.append(key_normalization)
 
     def get_data(self):
-        self._train_data = self.init_data(self.train_indices, "train")
-        self._test_data = self.init_data(self.test_indices, "test")
+        self._train_data = self.init_data(self.train_full_caseids, "train")
+        self._test_data = self.init_data(self.test_full_caseids, "test")
         self._aggregatable = ["df", "df_query_points"]
 
     def load_file(self, file_path: Path) -> np.ndarray:

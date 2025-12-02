@@ -14,21 +14,32 @@ class Integral_Cd(paddle.nn.Layer):
                                          out_features=layers[i + 1]))
             if i < self.n_layers - 1:                
                 if normalize:
-                    self.layers.append(paddle.nn.BatchNorm(num_features=layers[i+1]))
+                    self.layers.append(paddle.nn.BatchNorm(num_channels=layers[i+1]))
                 if dropout:
                     self.layers.append(nn.dropout(p=0.2))
                 self.layers.append(nn.GELU())         
 
-    
-    def forward(self, cd_dict, out_keys=None, ):      
+    def forward(self, F_M_dict, out_keys=None, ):    
+        
+        F_pressure_pred = F_M_dict['F_pressure_pred']
+        F_wallshearstress_pred = F_M_dict['F_wallshearstress_pred']
+        M_pressure_pred = F_M_dict['M_pressure_pred']
+        M_wallshearstress_pred = F_M_dict['M_wallshearstress_pred']
+        F_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+        M_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
 
-        cd_pred = paddle.to_tensor([cd_dict[f'Cd_{out_keys[0]}_pred'],
-                                    cd_dict[f'Cd_{out_keys[1]}_pred']]).cuda(blocking=True)
-        for _, layer in enumerate(self.layers):
-            cd_pred = layer(cd_pred)
-        cd_pred = paddle.Tensor.sigmoid(cd_pred) * (0.6 - 0.1) + 0.1
-        cd_dict.update({'Cd_pred_modify': cd_pred})
-        return cd_dict
+        for i in range(F_pressure_pred.shape[0]):
+            
+            F = paddle.to_tensor([F_pressure_pred[i], F_wallshearstress_pred[i]]).cuda(blocking=True)
+            M = paddle.to_tensor([M_pressure_pred[i], M_wallshearstress_pred[i]]).cuda(blocking=True)
+            for _, layer in enumerate(self.layers):
+                F = layer(F)
+                M = layer(M)
+            F_pred[i] = F#paddle.Tensor.sigmoid(F) * (0.6 - 0.1) + 0.1
+            M_pred[i] = M#paddle.Tensor.sigmoid(M) * (0.6 - 0.1) + 0.1
+        F_M_dict.update({'F_pred_modify': F_pred, 'M_pred_modify': M_pred})
+        
+        return F_M_dict
     
     
     def forward_v1(self, pred, truth: paddle.Tensor,                  

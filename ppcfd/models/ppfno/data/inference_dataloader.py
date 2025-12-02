@@ -15,6 +15,7 @@ import meshio
 import numpy as np
 import open3d as o3d
 import paddle
+import math
 
 from .base_datamodule import BaseDataModule
 
@@ -84,21 +85,22 @@ class PathDictDataset(paddle.io.Dataset, LoadFile):
         return_dict["df"] = self.load_file(f"df_{file_index}")
         return_dict["df_query_points"] = paddle.to_tensor(data=self.query_points)
         return_dict["vertices"] = None
-        reference_area = return_dict["info"]["reference_area"]
+        reference_area = float(return_dict["info"]["area"])
         areas = self.load_file(f"area_{file_index}")
         centroids = self.load_file(f"centroid_{file_index}")
         triangle_normals = self.load_file(f"normal_{file_index}")
+        return_dict["triangle_normals"] = triangle_normals
 
         flow_directions = paddle.zeros_like(x=triangle_normals)
         flow_directions[:, 0] = -1
-        mass_density = return_dict["info"]["density"]
-        flow_speed = return_dict["info"]["velocity"]
+        mass_density = float(return_dict["info"]["density"])
+        flow_speed = math.sqrt(float(return_dict["info"]["car_speed"])**2 + float(return_dict["info"]["wind_speed"])**2)
         const = 2.0 / (mass_density * flow_speed**2 * reference_area)
         projection = paddle.sum(
             x=(triangle_normals * 1e10) * flow_directions, axis=1, keepdim=False
         )
-        return_dict["dragWeight"] = const * projection * areas
-        return_dict["dragWeightWss"] = (const * flow_directions * areas[:, None]).T
+        return_dict["dragWeight"] = projection * areas
+        return_dict["dragWeightWss"] = (flow_directions * areas[:, None]).T
         return_dict["areas"] = areas
         return_dict["centroids"] = centroids
         for key in self.norms_dict:
