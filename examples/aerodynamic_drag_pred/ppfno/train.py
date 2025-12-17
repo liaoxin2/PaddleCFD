@@ -181,7 +181,7 @@ def train(cfg: DictConfig):
         state = paddle.load(path=str(cfg.state))
         model.set_state_dict(state_dict=state["model"])
         optimizer.set_lr(state["lr"])
-        resume_ep = state["epoch"]
+        #resume_ep = state["epoch"]
         logging.info(f"Resuming model from epoch {resume_ep}.")
 
     device = ParallelEnv().device_id
@@ -369,12 +369,12 @@ def train(cfg: DictConfig):
             )
 
             load_types = {
-                'aerodynamic_lift': {'real': F_M_dict['F_truth'][1], 'pred': F_M_dict['F_pred'][1]},
-                'aerodynamic_drag': {'real': F_M_dict['F_truth'][0], 'pred': F_M_dict['F_pred'][0]},
-                'pneumatic_lateral_force': {'real': F_M_dict['F_truth'][2], 'pred': F_M_dict['F_pred'][2]},
-                'pneumatic_overturning_moment': {'real': F_M_dict['M_truth'][0], 'pred': F_M_dict['M_pred'][0]},
-                'pneumatic_pitching_moment': {'real': F_M_dict['M_truth'][1], 'pred': F_M_dict['M_pred'][1]},
-                'pneumatic_roll_moment': {'real': F_M_dict['M_truth'][2], 'pred': F_M_dict['M_pred'][2]},
+                'aerodynamic_lift': {'real': F_M_dict['F_truth'][1], 'pred': F_M_dict['F_pred'][1], 'pred_modify': F_M_dict['F_pred_modify'][1]},
+                'aerodynamic_drag': {'real': F_M_dict['F_truth'][0], 'pred': F_M_dict['F_pred'][0], 'pred_modify': F_M_dict['F_pred_modify'][0]},
+                'pneumatic_lateral_force': {'real': F_M_dict['F_truth'][2], 'pred': F_M_dict['F_pred'][2], 'pred_modify': F_M_dict['F_pred_modify'][2]},
+                'pneumatic_overturning_moment': {'real': F_M_dict['M_truth'][0], 'pred': F_M_dict['M_pred'][0], 'pred_modify': F_M_dict['M_pred_modify'][0]},
+                'pneumatic_pitching_moment': {'real': F_M_dict['M_truth'][1], 'pred': F_M_dict['M_pred'][1], 'pred_modify': F_M_dict['M_pred_modify'][1]},
+                'pneumatic_roll_moment': {'real': F_M_dict['M_truth'][2], 'pred': F_M_dict['M_pred'][2], 'pred_modify': F_M_dict['M_pred_modify'][2]},
             }
 
             sideslip_angle = calculate_lateral_angle(
@@ -392,11 +392,15 @@ def train(cfg: DictConfig):
             for load_name, values in load_types.items():
                 real_val = values['real'].numpy() if hasattr(values['real'], 'numpy') else values['real']
                 cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
+                cal_val_modify = values['pred_modify'].numpy() if hasattr(values['pred_modify'], 'numpy') else values['pred_modify']
                 cal_error = cal_val - real_val
+                cal_error_modify = cal_val_modify - real_val
                 case_coefficent_json_dict[load_name] = {
                     'real_value': float(real_val),
                     'cal_value': float(cal_val),
-                    'cal_error': float(cal_error)
+                    #'cal_value_modify': float(cal_val_modify),
+                    'cal_error': float(cal_error),
+                    #'cal_error_modify': float(cal_error_modify),
                 }
 
             caseid=datamodule.test_full_caseids[i]
@@ -545,15 +549,23 @@ def train(cfg: DictConfig):
                 M_truth = F_M_dict["M_truth"]
                 F_pred = F_M_dict["F_pred"]
                 M_pred = F_M_dict["M_pred"]
-                F_mre = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
+                F_mre_modify = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
                     x=F_truth
                 )
-                M_mre = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
+                M_mre_modify = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
                     x=M_truth
                 )
+                F_mre = paddle.abs(x=F_pred - F_truth) / paddle.abs(x=F_truth)
+                M_mre = paddle.abs(x=M_pred - M_truth) / paddle.abs(x=M_truth)
+
                 
-                loss += paddle.nn.functional.mse_loss(F_pred_modify, F_truth)
-                loss += paddle.nn.functional.mse_loss(M_pred_modify, M_truth)
+                loss += 1.2*paddle.nn.functional.mse_loss(F_pred[1], F_truth[1])
+                loss += 1.2*paddle.nn.functional.mse_loss(M_pred[1], M_truth[1])
+                loss += 16*paddle.nn.functional.mse_loss(F_pred[0], F_truth[0])
+                loss += 3.1*paddle.nn.functional.mse_loss(F_pred[2], F_truth[2])
+                loss += 0.7*paddle.nn.functional.mse_loss(M_pred[0], M_truth[0])
+                loss += 1.3*paddle.nn.functional.mse_loss(M_pred[2], M_truth[2])
+
 
                 train_l2_meter.update(
                     {"pressure": F_M_dict["L2_pressure"].detach().item()}
@@ -618,6 +630,8 @@ def train(cfg: DictConfig):
                 train_json_dict["pneumatic_overturning_moment"] = 0
                 train_json_dict["pneumatic_pitching_moment"] = 0
                 train_json_dict["pneumatic_roll_moment"] = 0
+            # train_json_dict["pressure_loss"] = train_l2_meter.avg["pressure"]
+            # train_json_dict["shear_stress_loss"] = train_l2_meter.avg["wallshearstress"]
 
         if num_OOM != 0:
             logging.info(f"WARNING: {num_OOM} samples OOM, skipping these samples.")

@@ -234,40 +234,27 @@ class GNOFNOGNO_all(GNOFNOGNO):
         area = data_dict["areas"][0]
 
         wind_angle = float(data_dict["info"][0]["wind_angle"])
-        velocity = math.sqrt(float(data_dict["info"][0]["wind_speed"]) ** 2 + float(data_dict["info"][0]["car_speed"]) ** 2)  
+        car_speed = float(data_dict["info"][0]["car_speed"])
+        wind_speed = float(data_dict["info"][0]["wind_speed"])
+
         angle_field = wind_angle * paddle.ones_like(x=df).astype("float32")
-        speed_field = velocity * paddle.ones_like(x=df).astype("float32")
+        car_field = car_speed * paddle.ones_like(x=df).astype("float32")
+        wind_field = wind_speed * paddle.ones_like(x=df).astype("float32")
     
-        df = paddle.concat(x=(df, angle_field, speed_field), axis=0)
+        df = paddle.concat(x=(df, angle_field, car_field, wind_field), axis=0)
         if self.use_adain:
-            vel = paddle.to_tensor(data=[[wind_angle, velocity]], dtype="float32")
+            vel = paddle.to_tensor(data=[[wind_angle, car_speed, wind_speed]], dtype="float32")
             vel_embed = self.adain_pos_embed(vel)
             vel_embed = vel_embed.squeeze(0)  
             for norm in self.fno.fno_blocks.norm:
                 norm.update_embeddding(vel_embed)
-
-        # wind_angle = float(data_dict["info"][0]["wind_angle"])
-        # car_speed = float(data_dict["info"][0]["car_speed"])
-        # wind_speed = float(data_dict["info"][0]["wind_speed"])
-
-        # angle_field = wind_angle * paddle.ones_like(x=df).astype("float32")
-        # car_field = car_speed * paddle.ones_like(x=df).astype("float32")
-        # wind_field = wind_speed * paddle.ones_like(x=df).astype("float32")
-    
-        # df = paddle.concat(x=(df, angle_field, car_field, wind_field), axis=0)
-        # if self.use_adain:
-        #     vel = paddle.to_tensor(data=[[wind_angle, car_speed, wind_speed]], dtype="float32")
-        #     vel_embed = self.adain_pos_embed(vel)
-        #     vel_embed = vel_embed.squeeze(0)  
-        #     for norm in self.fno.fno_blocks.norm:
-        #         norm.update_embeddding(vel_embed)
         return x_in, x_out, df, area
 
     def cal_F_M(self, data_dict, pred_decode, truth_decode, key="pressure"):
         r0 = paddle.to_tensor([-3.125, 0.0, 0.0], dtype="float32")
         triangle_normals = data_dict["triangle_normals"][0] 
         areas = data_dict["areas"][0].reshape([-1, 1]) 
-        centroids = data_dict["centroids"][0]
+        centroids = data_dict["centroids_no_norms"][0]
 
         if key == "pressure":
             # 真值每三角形牵引力 (N,3)
@@ -392,6 +379,8 @@ class GNOFNOGNO_all(GNOFNOGNO):
         F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
         F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
         F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
+        F_M_dict.update({"F_const": data_dict["F_const"][0]})
+        F_M_dict.update({"M_const": data_dict["M_const"][0]})
         F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
         F_M_dict.update({"L2_pressure": out_dict["L2_pressure"]})
         F_M_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
@@ -453,7 +442,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
                 r0 = paddle.to_tensor([-3.125, 0.0, 0.0], dtype="float32")
                 triangle_normals = data_dict["triangle_normals"][0] 
                 areas = data_dict["areas"][0].reshape([-1, 1]) 
-                centroids = data_dict["centroids"][0]
+                centroids = data_dict["centroids_no_norms"][0]
                 
                 if key == "pressure":
                     traction_pred = -pred_decode.reshape([-1, 1]) * triangle_normals
@@ -538,25 +527,10 @@ class GNOFNOGNO_all(GNOFNOGNO):
 
             F_M_dict.update({"OOM": False})
             try:
-                out_dict, _, _, _ = self.eval_dict(
+                out_dict, _, _, F_M = self.eval_dict(
                     device, data_dict, loss_fn=loss_fn, decode_fn=decode_fn
                 )
-
-                F_M_dict.update({"F_pred": out_dict["F_pred"]})
-                F_M_dict.update({"F_truth": out_dict["F_truth"]})
-                F_M_dict.update({"M_pred": out_dict["M_pred"]})
-                F_M_dict.update({"M_truth": out_dict["M_truth"]})
-                F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
-                F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
-                F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
-                F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
-                F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
-                F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
-                F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
-                F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
-                F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
-                F_M_dict.update({"L2_pressure": out_dict["L2_pressure"]})
-                F_M_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
+                F_M_dict.update(F_M)
 
             except MemoryError as e:
                 if "Out of memory" in str(e):
@@ -567,45 +541,5 @@ class GNOFNOGNO_all(GNOFNOGNO):
                 else:
                     raise
 
-        # else:
-
-        #     pred_decode = pred.transpose(perm=[1, 0])
-        #     truth_decode = truth.transpose(perm=[1, 0])
-        #     F_total_truth_p, F_total_pred_p, M_total_truth_p, M_total_pred_p = self.cal_F_M(
-        #             data_dict, pred_decode[0], truth_decode[0], key='pressure')
-
-        #     F_total_truth_wss, F_total_pred_wss, M_total_truth_wss, M_total_pred_wss = self.cal_F_M(
-        #             data_dict, pred_decode[1:], truth_decode[1:], key='wallshearstress')
-        #     out_dict = {}
-        #     out_dict.update(
-        #         {
-        #             "F_pressure_pred": F_total_pred_p,
-        #             "F_pressure_truth": F_total_truth_p,
-        #             "M_pressure_pred": M_total_pred_p,
-        #             "M_pressure_truth": M_total_truth_p,
-        #             "F_wallshearstress_pred": F_total_pred_wss,
-        #             "F_wallshearstress_truth": F_total_truth_wss,
-        #             "M_wallshearstress_pred": M_total_pred_wss,
-        #             "M_wallshearstress_truth": M_total_truth_wss,
-        #             "F_pred": F_total_pred_p + F_total_pred_wss,
-        #             "F_truth": F_total_truth_p + F_total_truth_wss,
-        #             "M_pred": M_total_pred_p + M_total_pred_wss,
-        #             "M_truth": M_total_truth_p + M_total_truth_wss,
-        #         }
-        #     )
-
-        #     F_M_dict.update({"F_pred": out_dict["F_pred"]})
-        #     F_M_dict.update({"F_truth": out_dict["F_truth"]})
-        #     F_M_dict.update({"M_pred": out_dict["M_pred"]})
-        #     F_M_dict.update({"M_truth": out_dict["M_truth"]})
-        #     F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
-        #     F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
-        #     F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
-        #     F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
-        #     F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
-        #     F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
-        #     F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
-        #     F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
-        #     F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
 
         return pred.transpose(perm=[1, 0]), truth.transpose(perm=[1, 0]), F_M_dict

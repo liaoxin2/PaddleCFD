@@ -93,5 +93,54 @@ class Integral_Cd(paddle.nn.Layer):
 
 
 
+# class Integral_Cd(paddle.nn.Layer):
+#     def __init__(self, layers=None, dropout=False, normalize=False):
+#         super().__init__()
 
+#         # 默认网络结构 6 → 64 → 64 → 3
+#         if layers is None:
+#             layers = [6, 64, 64, 3]
+
+#         self.n_layers = len(layers) - 1
+#         net_layers = []
+
+#         for i in range(self.n_layers):
+#             # 线性层
+#             net_layers.append(nn.Linear(layers[i], layers[i+1]))
+
+#             # 中间层添加 BN、Dropout、GELU
+#             if i < self.n_layers - 1:
+#                 if normalize:
+#                     net_layers.append(nn.BatchNorm(layers[i+1]))
+#                 if dropout:
+#                     net_layers.append(nn.Dropout(p=0.2))
+#                 net_layers.append(nn.GELU())
+
+#         self.layers = nn.LayerList(net_layers)
+
+
+#     def forward(self, F_M_dict, out_keys=None, ):    
+
+#         F_pressure_pred = F_M_dict['F_pressure_pred']
+#         F_wallshearstress_pred = F_M_dict['F_wallshearstress_pred']
+#         M_pressure_pred = F_M_dict['M_pressure_pred']
+#         M_wallshearstress_pred = F_M_dict['M_wallshearstress_pred']
+#         F_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+#         M_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+
+#         F = paddle.to_tensor([F_M_dict['F_pressure_pred'],
+#                                 F_M_dict['F_wallshearstress_pred']]).reshape([1,6]).cuda(blocking=True)
+#         M = paddle.to_tensor([F_M_dict['M_pressure_pred'],
+#                                 F_M_dict['M_wallshearstress_pred']]).reshape([1,6]).cuda(blocking=True)
+#         # 网络前向计算
+#         for layer in self.layers:
+#             F = layer(F)
+#             M = layer(M)
+
+#         F_pred = F[0]
+#         M_pred = M[0]
+
+#         F_M_dict.update({'F_pred_modify': F_pred, 'M_pred_modify': M_pred})
+
+#         return F_M_dict
 

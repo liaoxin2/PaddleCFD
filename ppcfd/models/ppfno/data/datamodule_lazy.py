@@ -245,10 +245,10 @@ class PathDictDataset(paddle.io.Dataset, LoadMesh, LoadFile):
         projection = paddle.sum(
             x=(triangle_normals  * 1e10) * flow_directions, axis=1, keepdim=False
         )
-        return_dict["dragWeight"] =  projection * areas
-        return_dict["dragWeightWss"] = ( flow_directions * areas[:, None]).T
+        return_dict["F_const"] = 2.0 / (mass_density * flow_speed**2 * reference_area)
+        return_dict["M_const"] = 2.0 / (mass_density * flow_speed**2 * reference_area * 0.3)
         return_dict["areas"] = areas
-        return_dict["centroids"] = centroids
+        return_dict["centroids_no_norms"] = centroids
         for key in self.norms_dict:
             if key in return_dict:
                 return_dict[key] = self.norms_dict[key](return_dict[key])
@@ -256,7 +256,7 @@ class PathDictDataset(paddle.io.Dataset, LoadMesh, LoadFile):
             if return_dict["vertices"] is not None:
                 return_dict["vertices"] = self.norms_dict["location"](vertices)
             return_dict["centroids"] = self.norms_dict["location"](
-                return_dict["centroids"]
+                return_dict["centroids_no_norms"]
             )
             return_dict["df_query_points"] = self.norms_dict["location"](
                 return_dict["df_query_points"]

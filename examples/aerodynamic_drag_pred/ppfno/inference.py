@@ -188,12 +188,14 @@ def inference(cfg: DictConfig):
     for i, data_dict in enumerate(inference_dataloader):
         if ',' in data_dict['info'][0]['wind_speed']:
             value_list = [float(wind_speed) for wind_speed in data_dict['info'][0]['wind_speed'].split(',')]
+            value_type = 'wind_speed'
         else:
             value_list = [float(wind_angle) for wind_angle in data_dict['info'][0]['wind_angle'].split(',')]
+            value_type = 'wind_angle'
 
         for value in value_list:
             inference_json_dict = {}
-            if ',' in data_dict['info'][0]['wind_speed']:
+            if value_type == 'wind_speed':
                 data_dict['info'][0]['wind_speed'] = value
                 inference_json_dict['type'] = 'wind_speed'
             else:
@@ -262,14 +264,21 @@ def inference(cfg: DictConfig):
             mass_density = float(data_dict["info"][0]["density"])
             reference_area = float(data_dict["info"][0]["area"])
             flow_speed = math.sqrt(float(data_dict["info"][0]["car_speed"])**2 + float(data_dict["info"][0]["wind_speed"])**2)
-            const = 2.0 / (mass_density * flow_speed**2 * reference_area)
+            F_const = 2.0 / (mass_density * flow_speed**2 * reference_area)
+            M_const = 2.0 / (mass_density * flow_speed**2 * reference_area * 0.3)
 
             for load_name, values in load_types.items():
                 cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
-                inference_json_dict[load_name] = {
-                    'cal_value': float(cal_val),
-                    'coefficient': float(cal_val)*const,
-                }
+                if load_name in ['aerodynamic_lift', 'aerodynamic_drag', 'pneumatic_lateral_force']:
+                    inference_json_dict[load_name] = {
+                        'cal_value': float(cal_val),
+                        'coefficient': float(cal_val)*F_const,
+                    }
+                else:
+                    inference_json_dict[load_name] = {
+                        'cal_value': float(cal_val),
+                        'coefficient': float(cal_val)*M_const,
+                    }
 
             append_dict_to_json_list(inference_json_file_path, inference_json_dict)
 
