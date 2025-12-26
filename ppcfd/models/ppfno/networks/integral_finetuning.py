@@ -6,7 +6,7 @@ class Integral_Cd(paddle.nn.Layer):
     def __init__(self, layers=None, dropout=False, normalize=False):
         super().__init__()
         if layers == None:
-            layers = [2, 32, 32, 1]
+            layers = [2, 64, 128, 64, 1]
         self.n_layers = len(layers) - 1
         self.layers = nn.LayerList()
         for i in range(self.n_layers):
@@ -144,3 +144,25 @@ class Integral_Cd(paddle.nn.Layer):
 
 #         return F_M_dict
 
+
+# def forward(self, F_M_dict, out_keys=None, ):    
+        
+#         F_pressure_pred = F_M_dict['F_pressure_pred']
+#         F_wallshearstress_pred = F_M_dict['F_wallshearstress_pred']
+#         M_pressure_pred = F_M_dict['M_pressure_pred']
+#         M_wallshearstress_pred = F_M_dict['M_wallshearstress_pred']
+#         F_M_pred = paddle.to_tensor([F_pressure_pred[0], F_wallshearstress_pred[0], 
+#                                     F_pressure_pred[1], F_wallshearstress_pred[1],
+#                                     F_pressure_pred[2], F_wallshearstress_pred[2],
+#                                     M_pressure_pred[0], M_wallshearstress_pred[0],
+#                                     M_pressure_pred[1], M_wallshearstress_pred[1],
+#                                     M_pressure_pred[2], M_wallshearstress_pred[2]]).cuda(blocking=True)
+
+        
+#         for _, layer in enumerate(self.layers):
+#             F_M_pred = layer(F_M_pred)
+#         F_pred = F_M_pred[:3]#paddle.Tensor.sigmoid(F) * (0.6 - 0.1) + 0.1
+#         M_pred = F_M_pred[3:]#paddle.Tensor.sigmoid(M) * (0.6 - 0.1) + 0.1
+#         F_M_dict.update({'F_pred_modify': F_pred, 'M_pred_modify': M_pred})
+        
+#         return F_M_dict

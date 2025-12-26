@@ -12,6 +12,7 @@ from typing import List
 from typing import Tuple
 
 import hydra
+import logging
 import meshio
 import numpy as np
 import open3d as o3d
@@ -149,9 +150,16 @@ def main(cfg: DictConfig):
         )  
         bounds_dir = cfg.bounds_dir
 
+        logging.basicConfig(
+            filename=os.path.join(cfg.pre_output_path, "pre.log"),
+            level=logging.INFO,
+            format="%(asctime)s:%(levelname)s: %(message)s",
+            force=True,
+        )
+
         stlIDs = [d for d in os.listdir(geo_path) if d[-4:] == ".stl"]
-        print("All stlID:", stlIDs)
-        print("Chosen stlID:", stlIDs)
+        logging.info(f"All stlID: {stlIDs}")
+        logging.info(f"Chosen stlID: {stlIDs}")
 
         index = 200
         for stlID in stlIDs:
@@ -169,6 +177,7 @@ def main(cfg: DictConfig):
             compute_df = Compute_df_stl(geo_path, save_path, stlID, index, bounds_dir)
             compute_df.compute_df_from_mesh()
             index += 1
+            logging.info(f"Finished caseID: {stlID} finished")
 
     else:
         raise

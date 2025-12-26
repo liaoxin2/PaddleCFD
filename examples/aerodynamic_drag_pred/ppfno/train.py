@@ -30,6 +30,7 @@ from ppcfd.models.ppfno.data import instantiate_datamodule
 from ppcfd.models.ppfno.losses import LpLoss
 from ppcfd.models.ppfno.networks import instantiate_network
 from ppcfd.models.ppfno.optim.schedulers import instantiate_scheduler
+from ppcfd.models.ppfno.optim.soap import SOAP
 from ppcfd.models.ppfno.utils.average_meter import AverageMeter
 from ppcfd.models.ppfno.utils.average_meter import AverageMeterDict
 from ppcfd.models.ppfno.utils.dot_dict import DotDict
@@ -171,6 +172,7 @@ def train(cfg: DictConfig):
     optimizer = paddle.optimizer.AdamW(
         parameters=model.parameters(), learning_rate=cfg.lr, weight_decay=1e-06
     )
+    # optimizer = SOAP(parameters=model.parameters(), learning_rate=cfg.lr, weight_decay=1e-06)
     loss_fn = LpLoss(size_average=True)
     if cfg.enable_ddp:
         model = fleet.distributed_model(model)
@@ -238,6 +240,9 @@ def train(cfg: DictConfig):
 
     def cal_mre(pred, label):
         return paddle.abs(x=pred - label) / paddle.abs(x=label)
+
+    max_loss_case_id = None
+    min_loss_case_id = None
 
     def evaluate_on_fly(epoch_id) -> int | None:
         t1 = default_timer()
@@ -346,6 +351,11 @@ def train(cfg: DictConfig):
                         F_error = mre.numpy()
                     if k == "M_pred" :
                         M_error = mre.numpy()
+
+            F_mre_modify = cal_mre(F_M_dict["F_pred_modify"], out_dict["F_truth"])
+            M_mre_modify = cal_mre(F_M_dict["M_pred_modify"], out_dict["M_truth"])
+            eval_meter.update({"MRE_F_modify": F_mre_modify})
+            eval_meter.update({"MRE_M_modify": M_mre_modify})
 
             # if F_error.sum() + M_error.sum() > max_error:
             #     max_error = F_error.sum() + M_error.sum()
@@ -555,16 +565,16 @@ def train(cfg: DictConfig):
                 M_mre_modify = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
                     x=M_truth
                 )
-                F_mre = paddle.abs(x=F_pred - F_truth) / paddle.abs(x=F_truth)
-                M_mre = paddle.abs(x=M_pred - M_truth) / paddle.abs(x=M_truth)
+                F_mre = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(x=F_truth)
+                M_mre = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(x=M_truth)
 
                 
-                loss += 1.2*paddle.nn.functional.mse_loss(F_pred[1], F_truth[1])
-                loss += 1.2*paddle.nn.functional.mse_loss(M_pred[1], M_truth[1])
-                loss += 16*paddle.nn.functional.mse_loss(F_pred[0], F_truth[0])
-                loss += 3.1*paddle.nn.functional.mse_loss(F_pred[2], F_truth[2])
-                loss += 0.7*paddle.nn.functional.mse_loss(M_pred[0], M_truth[0])
-                loss += 1.3*paddle.nn.functional.mse_loss(M_pred[2], M_truth[2])
+                loss += 1.2*paddle.nn.functional.mse_loss(F_pred_modify[1], F_truth[1])
+                loss += 1.2*paddle.nn.functional.mse_loss(M_pred_modify[1], M_truth[1])
+                loss += 50*paddle.nn.functional.mse_loss(F_pred_modify[0], F_truth[0])
+                loss += 3.1*paddle.nn.functional.mse_loss(F_pred_modify[2], F_truth[2])
+                loss += 0.7*paddle.nn.functional.mse_loss(M_pred_modify[0], M_truth[0])
+                loss += 1.3*paddle.nn.functional.mse_loss(M_pred_modify[2], M_truth[2])
 
 
                 train_l2_meter.update(

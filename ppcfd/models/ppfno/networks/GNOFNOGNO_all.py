@@ -530,7 +530,21 @@ class GNOFNOGNO_all(GNOFNOGNO):
                 out_dict, _, _, F_M = self.eval_dict(
                     device, data_dict, loss_fn=loss_fn, decode_fn=decode_fn
                 )
-                F_M_dict.update(F_M)
+                F_M_dict.update({"F_pred": out_dict["F_pred"]})
+                F_M_dict.update({"F_truth": out_dict["F_truth"]})
+                F_M_dict.update({"M_pred": out_dict["M_pred"]})
+                F_M_dict.update({"M_truth": out_dict["M_truth"]})
+                F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
+                F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
+                F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
+                F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
+                F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
+                F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
+                F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
+                F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
+                F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
+                F_M_dict.update({"L2_pressure": out_dict["L2_pressure"]})
+                F_M_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
 
             except MemoryError as e:
                 if "Out of memory" in str(e):
