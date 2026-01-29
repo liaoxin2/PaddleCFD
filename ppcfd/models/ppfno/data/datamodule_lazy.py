@@ -434,7 +434,7 @@ class SAEDataModule(BaseCFDDataModule):
             all_files = os.listdir(self.data_dir)
             all_files = [file for file in all_files if file.endswith(".npy")]
             prefix = "area"
-            indices = [item[5:-10] for item in all_files if item.startswith(prefix)]
+            indices = [item[5:-8] for item in all_files if item.startswith(prefix)]
 
             def extract_number(s):
                 return int(s)
@@ -480,9 +480,12 @@ class SAEDataModule(BaseCFDDataModule):
                 [self.train_indices[j] for j in train_index],
                 [self.train_indices[k] for k in test_index],
             )
+            # self.train_indices = ['SFE-CR45AF-U3-FZ-002']
+            # self.test_indices = ['SFE-CR45AF-U3-FZ-003']
+            
             self.train_full_caseids, self.test_full_caseids = [], []
             for case in full_caseids:
-                if case[:-6] in self.train_indices:
+                if case[:-4] in self.train_indices:
                     self.train_full_caseids.append(case)
                 else:
                     self.test_full_caseids.append(case)

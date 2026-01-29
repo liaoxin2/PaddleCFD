@@ -19,25 +19,46 @@ class Integral_Cd(paddle.nn.Layer):
                     self.layers.append(nn.dropout(p=0.2))
                 self.layers.append(nn.GELU())         
 
-    def forward(self, F_M_dict, out_keys=None, ):    
-        
-        F_pressure_pred = F_M_dict['F_pressure_pred']
-        F_wallshearstress_pred = F_M_dict['F_wallshearstress_pred']
-        M_pressure_pred = F_M_dict['M_pressure_pred']
-        M_wallshearstress_pred = F_M_dict['M_wallshearstress_pred']
-        F_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
-        M_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+    def forward(self, F_M_dict, region_masks=None, out_keys=None):    
 
-        for i in range(F_pressure_pred.shape[0]):
+        if region_masks == None:
+            F_pressure_pred = F_M_dict['F_pressure_pred']
+            F_wallshearstress_pred = F_M_dict['F_wallshearstress_pred']
+            M_pressure_pred = F_M_dict['M_pressure_pred']
+            M_wallshearstress_pred = F_M_dict['M_wallshearstress_pred']
+            F_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+            M_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+
+            for i in range(F_pressure_pred.shape[0]):
+                
+                F = paddle.to_tensor([F_pressure_pred[i], F_wallshearstress_pred[i]]).cuda(blocking=True)
+                M = paddle.to_tensor([M_pressure_pred[i], M_wallshearstress_pred[i]]).cuda(blocking=True)
+                for _, layer in enumerate(self.layers):
+                    F = layer(F)
+                    M = layer(M)
+                F_pred[i] = F#paddle.Tensor.sigmoid(F) * (0.6 - 0.1) + 0.1
+                M_pred[i] = M#paddle.Tensor.sigmoid(M) * (0.6 - 0.1) + 0.1
+            F_M_dict.update({'F_pred_modify': F_pred, 'M_pred_modify': M_pred})
+        else:
+            for region, mask in region_masks.items():
             
-            F = paddle.to_tensor([F_pressure_pred[i], F_wallshearstress_pred[i]]).cuda(blocking=True)
-            M = paddle.to_tensor([M_pressure_pred[i], M_wallshearstress_pred[i]]).cuda(blocking=True)
-            for _, layer in enumerate(self.layers):
-                F = layer(F)
-                M = layer(M)
-            F_pred[i] = F#paddle.Tensor.sigmoid(F) * (0.6 - 0.1) + 0.1
-            M_pred[i] = M#paddle.Tensor.sigmoid(M) * (0.6 - 0.1) + 0.1
-        F_M_dict.update({'F_pred_modify': F_pred, 'M_pred_modify': M_pred})
+                F_pressure_pred = F_M_dict[f'F_pressure_{region}_pred']
+                F_wallshearstress_pred = F_M_dict[f'F_wallshearstress_{region}_pred']
+                M_pressure_pred = F_M_dict[f'M_pressure_{region}_pred']
+                M_wallshearstress_pred = F_M_dict[f'M_wallshearstress_{region}_pred']
+                F_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+                M_pred = paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True)
+
+                for i in range(F_pressure_pred.shape[0]):
+                    
+                    F = paddle.to_tensor([F_pressure_pred[i], F_wallshearstress_pred[i]]).cuda(blocking=True)
+                    M = paddle.to_tensor([M_pressure_pred[i], M_wallshearstress_pred[i]]).cuda(blocking=True)
+                    for _, layer in enumerate(self.layers):
+                        F = layer(F)
+                        M = layer(M)
+                    F_pred[i] = F#paddle.Tensor.sigmoid(F) * (0.6 - 0.1) + 0.1
+                    M_pred[i] = M#paddle.Tensor.sigmoid(M) * (0.6 - 0.1) + 0.1
+                F_M_dict.update({f'F_pred_{region}_modify': F_pred, f'M_pred_{region}_modify': M_pred})
         
         return F_M_dict
     

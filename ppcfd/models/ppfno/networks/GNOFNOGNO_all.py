@@ -4,6 +4,7 @@ import sys
 import paddle
 import paddle.nn as nn
 import math
+import json
 
 from ..neuralop.models import FNO
 from .base_model import BaseModel
@@ -79,7 +80,6 @@ class GNOFNOGNO(BaseModel):
             non_linearity=paddle.nn.functional.gelu,
             n_dim=1,
         )
-        self.integral_cd = Integral_Cd()
         self.print_model_size()
 
     def forward(self, x_in, x_out, df, x_eval=None, area_in=None, area_eval=None):
@@ -181,6 +181,8 @@ class GNOFNOGNO_all(GNOFNOGNO):
         max_in_points=5000,
         subsample_train=1,
         subsample_eval=1,
+        reference_point=[-3.20625,0,0],
+        layers=[2,64,128,64,1],
         out_keys=["pressure"],
     ):
         if fno_norm == "ada_in":
@@ -192,6 +194,8 @@ class GNOFNOGNO_all(GNOFNOGNO):
         self.subsample_eval = subsample_eval
         self.out_keys = out_keys
         self.out_channels = out_channels
+        self.reference_point = reference_point
+        self.layers = layers
         super().__init__(
             radius_in=radius_in,
             radius_out=radius_out,
@@ -209,6 +213,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
             linear_kernel=linear_kernel,
             weighted_kernel=weighted_kernel,
         )
+        self.integral_cd = Integral_Cd(layers=self.layers)
         if fno_norm == "ada_in":
             self.adain_pos_embed = PositionalEmbedding(adain_embed_dim)
             self.fno.fno_blocks.norm = paddle.nn.LayerList(
@@ -250,46 +255,72 @@ class GNOFNOGNO_all(GNOFNOGNO):
                 norm.update_embeddding(vel_embed)
         return x_in, x_out, df, area
 
-    def cal_F_M(self, data_dict, pred_decode, truth_decode, key="pressure"):
-        r0 = paddle.to_tensor([-3.125, 0.0, 0.0], dtype="float32")
-        triangle_normals = data_dict["triangle_normals"][0] 
-        areas = data_dict["areas"][0].reshape([-1, 1]) 
-        centroids = data_dict["centroids_no_norms"][0]
+    def build_region_masks(self, points, boundaries):
+        x = points[:, 0]
+        boundaries = paddle.to_tensor(boundaries)
 
+        masks = {}
+
+        masks["carriage_1"] = x < boundaries[0]
+
+        for i in range(len(boundaries) - 1):
+            masks[f"carriage_{i+2}"] = (x >= boundaries[i]) & (x < boundaries[i + 1])
+
+        masks[f"carriage_{len(boundaries)+1}"] = x >= boundaries[-1]
+
+        return masks
+
+    def cal_F_M(self, data_dict, pred_decode, truth_decode, region_masks, key="pressure"):
+        r0 = data_dict["info"][0]["reference_point"]
+        r0 = json.loads(r0)
+
+        triangle_normals = data_dict["triangle_normals"][0]        # (N,3)
+        areas = data_dict["areas"][0].reshape([-1, 1])             # (N,1)
+        centroids = data_dict["centroids_no_norms"][0]             # (N,3)
+
+        # ======================
+        # 单元力计算（不区分区域）
+        # ======================
         if key == "pressure":
-            # 真值每三角形牵引力 (N,3)
-            traction_truth = -truth_decode.reshape([-1, 1]) * triangle_normals  # (N,3)
-            F_per_truth = traction_truth * areas            # (N,3)
-            # 预测每三角形牵引力 (N,3)
-            traction_pred = -pred_decode.reshape([-1, 1]) * triangle_normals
-            F_per_pred = traction_pred * areas 
-            # 合力
-            F_total_truth = F_per_truth.sum(axis=0)    # (3,)
-            F_total_pred = F_per_pred.sum(axis=0)   # (3,)
-
-            # 力矩（关于 r0）： sum( (r_i - r0) x F_i )
-            r_rel = (centroids - r0)  # (N,3)
-            M_per_truth = paddle.cross(r_rel, F_per_truth)  # (N,3)
-            M_per_pred = paddle.cross(r_rel, F_per_pred)
-            M_total_truth = M_per_truth.sum(axis=0)
-            M_total_pred = M_per_pred.sum(axis=0)
+            traction_truth = -truth_decode.reshape([-1, 1]) * triangle_normals
+            traction_pred  = -pred_decode.reshape([-1, 1])  * triangle_normals
         elif key == "wallshearstress":
-            traction_truth = truth_decode.T
-            F_per_truth = -traction_truth * areas
+            traction_truth = -truth_decode.T
+            traction_pred  = -pred_decode.T
+        else:
+            raise ValueError(f"Unknown key: {key}")
 
-            traction_pred = pred_decode.T
-            F_per_pred = -traction_pred * areas
+        F_per_truth = traction_truth * areas      # (N,3)
+        F_per_pred  = traction_pred  * areas
 
-            F_total_truth = F_per_truth.sum(axis=0)
-            F_total_pred = F_per_pred.sum(axis=0)
+        # ======================
+        # 分区域积分
+        # ======================
+        results = {}
 
-            r_rel = (centroids - r0)  # (N,3)
-            M_per_truth = paddle.cross(r_rel, F_per_truth)
-            M_per_pred = paddle.cross(r_rel, F_per_pred)
-            M_total_truth = M_per_truth.sum(axis=0)
-            M_total_pred = M_per_pred.sum(axis=0)
-        
-        return F_total_truth, F_total_pred, M_total_truth, M_total_pred
+        for region, mask in region_masks.items():
+            r_rel = centroids - paddle.to_tensor(r0[int(region.split('_')[1])-1], dtype="float32")
+            
+            F_r_truth = F_per_truth[mask]
+            F_r_pred  = F_per_pred[mask]
+
+            r_r = r_rel[mask]
+
+            F_total_truth = F_r_truth.sum(axis=0)
+            F_total_pred  = F_r_pred.sum(axis=0)
+
+            M_total_truth = paddle.cross(r_r, F_r_truth).sum(axis=0)
+            M_total_pred  = paddle.cross(r_r, F_r_pred).sum(axis=0)
+
+            results[region] = {
+                "F_truth": F_total_truth,
+                "F_pred":  F_total_pred,
+                "M_truth": M_total_truth,
+                "M_pred":  M_total_pred,
+            }
+
+        return results
+
 
     @paddle.no_grad()
     def eval_dict(self, device, data_dict, loss_fn=None, decode_fn=None, **kwargs):
@@ -331,6 +362,22 @@ class GNOFNOGNO_all(GNOFNOGNO):
             "M_truth": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
         }
         truth = []
+
+        coordinate = data_dict['info'][0]["carriage_offset"]
+        if coordinate is not None and ',' in coordinate:
+            value_list = [float(i) for i in coordinate.split(',')]
+            region_masks = self.build_region_masks(
+                data_dict["centroids_no_norms"][0],
+                value_list,
+            )
+        elif coordinate is not None and ',' not in coordinate:
+            value_list = [float(coordinate)]
+            region_masks = self.build_region_masks(
+                data_dict["centroids_no_norms"][0],
+                value_list,
+            )
+        else:
+            region_masks = {'carriage_1':paddle.ones(data_dict["centroids_no_norms"][0].shape[0],dtype=paddle.bool)}
         for i in range(len(self.out_keys)):
             key = self.out_keys[i]
             truth_key = data_dict[key][0].to(device)[:: self.subsample_eval, ...]
@@ -349,43 +396,41 @@ class GNOFNOGNO_all(GNOFNOGNO):
                 pred_decode = decode_fn(pred_key, i)
                 truth_decode = decode_fn(truth_key, i)
                 
-                F_total_truth, F_total_pred, M_total_truth, M_total_pred = self.cal_F_M(
-                    data_dict, pred_decode, truth_decode, key=key)
+                
+                if region_masks is not None:
+                    region_results = self.cal_F_M(
+                        data_dict,
+                        pred_decode,
+                        truth_decode,
+                        region_masks,
+                        key=key,
+                    )
 
-                out_dict.update(
-                    {
-                        f"F_{key}_pred": F_total_pred,
-                        f"F_{key}_truth": F_total_truth,
-                        f"M_{key}_pred": M_total_pred,
-                        f"M_{key}_truth": M_total_truth,
-                    }
-                )
-                out_dict["F_pred"] += F_total_pred
-                out_dict["F_truth"] += F_total_truth
-                out_dict["M_pred"] += M_total_pred
-                out_dict["M_truth"] += M_total_truth
+                    for region, vals in region_results.items():
+                        out_dict[f"F_{key}_{region}_pred"] = vals["F_pred"]
+                        out_dict[f"F_{key}_{region}_truth"] = vals["F_truth"]
+                        out_dict[f"M_{key}_{region}_pred"] = vals["M_pred"]
+                        out_dict[f"M_{key}_{region}_truth"] = vals["M_truth"]
+
+                        # 如果你仍然需要整车合量
+                        out_dict["F_pred"] += vals["F_pred"]
+                        out_dict["F_truth"] += vals["F_truth"]
+                        out_dict["M_pred"] += vals["M_pred"]
+                        out_dict["M_truth"] += vals["M_truth"]
 
         truth = paddle.concat(x=truth, axis=0)
         F_M_dict = {}
-        F_M_dict.update({"F_pred": out_dict["F_pred"]})
-        F_M_dict.update({"F_truth": out_dict["F_truth"]})
-        F_M_dict.update({"M_pred": out_dict["M_pred"]})
-        F_M_dict.update({"M_truth": out_dict["M_truth"]})
-        F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
-        F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
-        F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
-        F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
-        F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
-        F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
-        F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
-        F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
+        F_M_dict.update(out_dict)
+        for region, mask in region_masks.items():
+            F_M_dict.update({f"F_pred_{region}": F_M_dict[f"F_pressure_{region}_pred"]+F_M_dict[f"F_wallshearstress_{region}_pred"]})
+            F_M_dict.update({f"M_pred_{region}": F_M_dict[f"M_pressure_{region}_pred"]+F_M_dict[f"M_wallshearstress_{region}_pred"]})
+            F_M_dict.update({f"F_truth_{region}": F_M_dict[f"F_pressure_{region}_truth"]+F_M_dict[f"F_wallshearstress_{region}_truth"]})
+            F_M_dict.update({f"M_truth_{region}": F_M_dict[f"M_pressure_{region}_truth"]+F_M_dict[f"M_wallshearstress_{region}_truth"]})
         F_M_dict.update({"F_const": data_dict["F_const"][0]})
         F_M_dict.update({"M_const": data_dict["M_const"][0]})
-        F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
-        F_M_dict.update({"L2_pressure": out_dict["L2_pressure"]})
-        F_M_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
+        F_M_dict = self.integral_cd(F_M_dict, region_masks, self.out_keys)
 
-        return out_dict, pred, truth, F_M_dict
+        return out_dict, pred, truth, F_M_dict, region_masks
 
     @paddle.no_grad()
     def inference_dict(self, device, data_dict, loss_fn=None, decode_fn=None, **kwargs):
@@ -428,6 +473,23 @@ class GNOFNOGNO_all(GNOFNOGNO):
             "M_pred": paddle.to_tensor(data=[0.0, 0.0, 0.0]).cuda(blocking=True),
         }
 
+        coordinate = data_dict['info'][0]["carriage_offset"]
+        if coordinate is not None and ',' in coordinate:
+            value_list = [float(i) for i in coordinate.split(',')]
+            region_masks = self.build_region_masks(
+                data_dict["centroids_no_norms"][0],
+                value_list,
+            )
+        elif coordinate is not None and ',' not in coordinate:
+            value_list = [float(coordinate)]
+            region_masks = self.build_region_masks(
+                data_dict["centroids_no_norms"][0],
+                value_list,
+            )
+        else:
+            region_masks = {'carriage_1':paddle.ones(data_dict["centroids_no_norms"][0].shape[0],dtype=paddle.bool)}
+        carriage_number = data_dict['info'][0]["carriage_number"]
+
         for i in range(len(self.out_keys)):
             key = self.out_keys[i]
             # assert not paddle.any(paddle.isnan(truth_key)), "truth_key 存在无效值！"
@@ -439,26 +501,32 @@ class GNOFNOGNO_all(GNOFNOGNO):
             pred_key = pred[st:end, :]
             if decode_fn is not None:
                 pred_decode = decode_fn(pred_key, i)
-                r0 = paddle.to_tensor([-3.125, 0.0, 0.0], dtype="float32")
+                r0 = data_dict["info"][0]["reference_point"]
+                r0 = json.loads(r0)
                 triangle_normals = data_dict["triangle_normals"][0] 
                 areas = data_dict["areas"][0].reshape([-1, 1]) 
                 centroids = data_dict["centroids_no_norms"][0]
+                mask = region_masks[f'carriage_{carriage_number}']
                 
                 if key == "pressure":
                     traction_pred = -pred_decode.reshape([-1, 1]) * triangle_normals
                     F_per_pred = traction_pred * areas 
-                    F_total_pred = F_per_pred.sum(axis=0)   # (3,)
+                    F_r_pred  = F_per_pred[mask]
+                    F_total_pred = F_r_pred.sum(axis=0)   # (3,)
                     # 力矩（关于 r0）： sum( (r_i - r0) x F_i )
-                    r_rel = (centroids - r0)  # (N,3)
-                    M_per_pred = paddle.cross(r_rel, F_per_pred)
+                    r_rel = centroids - paddle.to_tensor(r0, dtype="float32") # (N,3)
+                    r_rel = r_rel[mask]
+                    M_per_pred = paddle.cross(r_rel, F_r_pred)
                     M_total_pred = M_per_pred.sum(axis=0)
                 elif key == "wallshearstress":
                     traction_pred = pred_decode.T
                     F_per_pred = -traction_pred * areas
-                    F_total_pred = F_per_pred.sum(axis=0)
+                    F_r_pred  = F_per_pred[mask]
+                    F_total_pred = F_r_pred.sum(axis=0)
 
-                    r_rel = (centroids - r0)  # (N,3)
-                    M_per_pred = paddle.cross(r_rel, F_per_pred)
+                    r_rel = centroids - paddle.to_tensor(r0, dtype="float32") # (N,3)
+                    r_rel = r_rel[mask]
+                    M_per_pred = paddle.cross(r_rel, F_r_pred)
                     M_total_pred = M_per_pred.sum(axis=0)
 
                 out_dict.update(
@@ -477,7 +545,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
         F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
         F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
         F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
-        F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
+        F_M_dict = self.integral_cd(F_M_dict, out_keys=self.out_keys)
 
         return out_dict, pred, F_M_dict
 
@@ -509,6 +577,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
             truth_key = truth_key[indices][:, : self.out_channels[i]].to(x_in.place)
             truth.append(truth_key)
         truth = paddle.concat(x=truth, axis=-1)
+        region_masks = None
 
         if self.integral_cd.parameters()[0].stop_gradient == True:
             pred = super().forward(
@@ -527,24 +596,16 @@ class GNOFNOGNO_all(GNOFNOGNO):
 
             F_M_dict.update({"OOM": False})
             try:
-                out_dict, _, _, F_M = self.eval_dict(
+                out_dict, _, _, F_M, region_masks= self.eval_dict(
                     device, data_dict, loss_fn=loss_fn, decode_fn=decode_fn
                 )
-                F_M_dict.update({"F_pred": out_dict["F_pred"]})
-                F_M_dict.update({"F_truth": out_dict["F_truth"]})
-                F_M_dict.update({"M_pred": out_dict["M_pred"]})
-                F_M_dict.update({"M_truth": out_dict["M_truth"]})
-                F_M_dict.update({"F_pressure_pred": out_dict["F_pressure_pred"]})
-                F_M_dict.update({"F_pressure_truth": out_dict["F_pressure_truth"]})
-                F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
-                F_M_dict.update({"F_wallshearstress_truth": out_dict["F_wallshearstress_truth"]})
-                F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
-                F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
-                F_M_dict.update({"M_pressure_truth": out_dict["M_pressure_truth"]})
-                F_M_dict.update({"M_wallshearstress_truth": out_dict["M_wallshearstress_truth"]})
-                F_M_dict = self.integral_cd(F_M_dict, self.out_keys)
-                F_M_dict.update({"L2_pressure": out_dict["L2_pressure"]})
-                F_M_dict.update({"L2_wallshearstress": out_dict["L2_wallshearstress"]})
+                F_M_dict.update(out_dict)
+                for region, mask in region_masks.items():
+                    F_M_dict.update({f"F_pred_{region}": F_M_dict[f"F_pressure_{region}_pred"]+F_M_dict[f"F_wallshearstress_{region}_pred"]})
+                    F_M_dict.update({f"M_pred_{region}": F_M_dict[f"M_pressure_{region}_pred"]+F_M_dict[f"M_wallshearstress_{region}_pred"]})
+                    F_M_dict.update({f"F_truth_{region}": F_M_dict[f"F_pressure_{region}_truth"]+F_M_dict[f"F_wallshearstress_{region}_truth"]})
+                    F_M_dict.update({f"M_truth_{region}": F_M_dict[f"M_pressure_{region}_truth"]+F_M_dict[f"M_wallshearstress_{region}_truth"]})
+                F_M_dict = self.integral_cd(F_M_dict, region_masks, self.out_keys)
 
             except MemoryError as e:
                 if "Out of memory" in str(e):
@@ -556,4 +617,4 @@ class GNOFNOGNO_all(GNOFNOGNO):
                     raise
 
 
-        return pred.transpose(perm=[1, 0]), truth.transpose(perm=[1, 0]), F_M_dict
+        return pred.transpose(perm=[1, 0]), truth.transpose(perm=[1, 0]), F_M_dict, region_masks

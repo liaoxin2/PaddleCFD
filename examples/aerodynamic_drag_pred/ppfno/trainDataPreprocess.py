@@ -271,7 +271,7 @@ def compute_save_bounds_all(dataset_path, save_path, info):
             if os.path.isdir(os.path.join(dataset_path, d))
         ]
     else:
-        sfeIDs = [os.path.basename(path) for path in dataset_path]
+        sfeIDs = [os.path.basename(os.path.split(path)[0]) for path in dataset_path]
     
     area_bounds_all = []
     global_bounds_all = []
@@ -285,17 +285,13 @@ def compute_save_bounds_all(dataset_path, save_path, info):
                 if os.path.isdir(os.path.join(dataset_path, sfeID, d))
             ]
         else:
-            caseIDs = [
-                d 
-                for d in os.listdir(dataset_path[i])
-                if os.path.isdir(os.path.join(dataset_path[i], d))
-            ]
+            caseIDs = [os.path.split(dataset_path[i])[1]]
 
         for caseID in caseIDs:
             if isinstance(dataset_path, str):
                 case_path = os.path.join(dataset_path, sfeID, caseID)
             else:
-                case_path = os.path.join(dataset_path[i], caseID)
+                case_path = dataset_path[i]
             data_trans = CFDDataTransiton(case_path, save_path, sfeID+'-'+caseID, info)
 
             csv_data = data_trans.csv_data
@@ -429,28 +425,31 @@ def main(cfg: DictConfig):
             ]
             for sfeID in sfeIDs:
                 for caseID in os.listdir(os.path.join(dataset_path, sfeID)):
-                    caseIDs.append([0,sfeID+'-'+caseID])
+                    caseIDs.append([os.path.join(dataset_path, sfeID),caseID,sfeID+'-'+caseID])
         else:
-            sfeIDs = [os.path.basename(path) for path in dataset_path]
             for path in dataset_path:
-                for d in os.listdir(path):
-                    caseIDs.append([path,os.path.basename(path)+'-'+d])
-        
+                dirname, basename = os.path.split(path)
+                grandparent_dir = os.path.basename(dirname)
+                caseIDs.append([dirname, basename, grandparent_dir + "-" + basename])
+
         caseIDs.sort()
 
         logging.info(f"number of caseIDs: {len(caseIDs)}")
 
         default_info = {
-            "wind_angle":4,
-            "car_speed": 64.84166326688857,
-            "wind_speed": 4.534170793368145,
+            "wind_angle":90,
+            "car_speed": 64.75265537596346,
+            "wind_speed": 5.665123278597781,
             "area": 0.15625,
-            "density": 1.225
+            "density": 1.225,
+            "group_type": "3",
+            "carriage_offset": "-1.603125,1.603125",
+            "reference_point": "[[-3.20625,0,0],[0,0,0],[3.20625,0,0]]"
         }
 
         compute_save_bounds_all(dataset_path, save_path, default_info)
         for caseID in caseIDs:
-            os.makedirs(os.path.join(cfg.pre_output_path, caseID[1], "log"), exist_ok=True)
+            os.makedirs(os.path.join(cfg.pre_output_path, caseID[2], "log"), exist_ok=True)
             logging.basicConfig(
                 filename=os.path.join(cfg.pre_output_path, "pre.log"),
                 level=logging.INFO,
@@ -458,17 +457,14 @@ def main(cfg: DictConfig):
                 force=True,
             )
             logging.info(f"Preprocessing caseID: {caseID[1]}")
-            if isinstance(dataset_path, str):
-                case_path = os.path.join(dataset_path, caseID[1][:20], caseID[1][21:])
-            else:
-                case_path = os.path.join(caseID[0], caseID[1][21:])
+            case_path = os.path.join(caseID[0], caseID[1])
 
-            json_file_path = os.path.join(case_path, caseID[1] + ".json")
+            json_file_path = os.path.join(case_path, caseID[2] + ".json")
             with open(json_file_path, 'r', encoding='utf-8') as file:
                 info = json.load(file)
 
-            auto_trans(case_path, save_path, caseID[1], info)
-            logging.info(f"Finished caseID: {caseID[1]}")
+            auto_trans(case_path, save_path, caseID[2], info)
+            logging.info(f"Finished caseID: {caseID[2]}")
     else:
         raise
 

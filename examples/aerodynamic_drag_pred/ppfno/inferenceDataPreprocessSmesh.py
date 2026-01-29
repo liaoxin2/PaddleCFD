@@ -150,6 +150,7 @@ def main(cfg: DictConfig):
         )  
         bounds_dir = cfg.bounds_dir
 
+        os.makedirs(os.path.join(cfg.pre_output_path), exist_ok=True)
         logging.basicConfig(
             filename=os.path.join(cfg.pre_output_path, "pre.log"),
             level=logging.INFO,

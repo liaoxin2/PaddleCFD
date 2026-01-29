@@ -15,7 +15,8 @@ def instantiate_network(config):
             =0.4, linear_kernel=True, weighted_kernel=config.
             weighted_kernel, subsample_train=config.subsample_train,
             subsample_eval=config.subsample_eval, max_in_points=config.
-            max_in_points, out_keys=config.out_keys)
+            max_in_points, out_keys=config.out_keys, reference_point=config.
+            reference_point, layers=config.layers)
     else:
         print('Model not found')
     print('The model size is ', count_params(model))

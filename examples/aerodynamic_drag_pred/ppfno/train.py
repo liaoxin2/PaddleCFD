@@ -151,7 +151,8 @@ def train(cfg: DictConfig):
         with open(json_file_path, "w") as file:
             json.dump([], file)
 
-    create_json(train_json_file_path)
+    if paddle.distributed.get_rank() == 0:
+        create_json(train_json_file_path)
 
     def append_dict_to_json_list(file_path, dict_element):
         assert os.path.exists(file_path), file_path
@@ -169,10 +170,12 @@ def train(cfg: DictConfig):
             json.dump(data, file, indent=4)
 
     model = instantiate_network(cfg)
-    optimizer = paddle.optimizer.AdamW(
-        parameters=model.parameters(), learning_rate=cfg.lr, weight_decay=1e-06
-    )
-    # optimizer = SOAP(parameters=model.parameters(), learning_rate=cfg.lr, weight_decay=1e-06)
+    if cfg.optimizer == "AdamW":
+        optimizer = paddle.optimizer.AdamW(
+            parameters=model.parameters(), learning_rate=cfg.lr, weight_decay=1e-06
+        )
+    elif cfg.optimizer == "SOAP":
+        optimizer = SOAP(parameters=model.parameters(), learning_rate=cfg.lr, weight_decay=1e-06)
     loss_fn = LpLoss(size_average=True)
     if cfg.enable_ddp:
         model = fleet.distributed_model(model)
@@ -284,7 +287,7 @@ def train(cfg: DictConfig):
             device = ParallelEnv().device_id
             device = paddle.CUDAPlace(device)
             try:
-                out_dict, pred, truth, F_M_dict = current_model.eval_dict(
+                out_dict, pred, truth, F_M_dict, region_masks = current_model.eval_dict(
                     device, data_dict, loss_fn=loss_fn, decode_fn=datamodule.decode
                 )
 
@@ -310,8 +313,8 @@ def train(cfg: DictConfig):
                         cfg.train_output_path,
                         "csv_vtp",
                         str(epoch_id),
-                        f"{str(caseid)[:20]}",
-                        f"{str(caseid)[21:]}",
+                        f"{str(caseid)[:-4]}",
+                        f"{str(caseid).split('-')[-1]}",
                         "case.json",
                     )
                     os.makedirs(os.path.dirname(json_filename), exist_ok=True)
@@ -352,80 +355,78 @@ def train(cfg: DictConfig):
                     if k == "M_pred" :
                         M_error = mre.numpy()
 
-            F_mre_modify = cal_mre(F_M_dict["F_pred_modify"], out_dict["F_truth"])
-            M_mre_modify = cal_mre(F_M_dict["M_pred_modify"], out_dict["M_truth"])
-            eval_meter.update({"MRE_F_modify": F_mre_modify})
-            eval_meter.update({"MRE_M_modify": M_mre_modify})
-
-            # if F_error.sum() + M_error.sum() > max_error:
-            #     max_error = F_error.sum() + M_error.sum()
-            #     max_loss_case_id = i
-            # if F_error.sum() + M_error.sum() < min_error:
-            #     min_error = F_error.sum() + M_error.sum()
-            #     min_loss_case_id = i
             total_error += F_error.sum() + M_error.sum()
+            
+            for region, mask in region_masks.items():
 
-            F_pred_modify = F_M_dict["F_pred_modify"]
-            M_pred_modify = F_M_dict["M_pred_modify"]
-            F_truth = out_dict["F_truth"]
-            M_truth = out_dict["M_truth"]
-            F_pred = out_dict["F_pred"]
-            M_pred = out_dict["M_pred"]
-            F_mre_modify = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
-                x=F_truth
-            )
-            M_mre_modify = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
-                x=M_truth
-            )
+                F_mre_modify = cal_mre(F_M_dict[f'F_pred_{region}_modify'], F_M_dict[f"F_truth_{region}"])
+                M_mre_modify = cal_mre(F_M_dict[f'M_pred_{region}_modify'], F_M_dict[f"M_truth_{region}"])
+                eval_meter.update({"MRE_F_modify": F_mre_modify})
+                eval_meter.update({"MRE_M_modify": M_mre_modify})
+            
 
-            load_types = {
-                'aerodynamic_lift': {'real': F_M_dict['F_truth'][1], 'pred': F_M_dict['F_pred'][1], 'pred_modify': F_M_dict['F_pred_modify'][1]},
-                'aerodynamic_drag': {'real': F_M_dict['F_truth'][0], 'pred': F_M_dict['F_pred'][0], 'pred_modify': F_M_dict['F_pred_modify'][0]},
-                'pneumatic_lateral_force': {'real': F_M_dict['F_truth'][2], 'pred': F_M_dict['F_pred'][2], 'pred_modify': F_M_dict['F_pred_modify'][2]},
-                'pneumatic_overturning_moment': {'real': F_M_dict['M_truth'][0], 'pred': F_M_dict['M_pred'][0], 'pred_modify': F_M_dict['M_pred_modify'][0]},
-                'pneumatic_pitching_moment': {'real': F_M_dict['M_truth'][1], 'pred': F_M_dict['M_pred'][1], 'pred_modify': F_M_dict['M_pred_modify'][1]},
-                'pneumatic_roll_moment': {'real': F_M_dict['M_truth'][2], 'pred': F_M_dict['M_pred'][2], 'pred_modify': F_M_dict['M_pred_modify'][2]},
-            }
+                F_pred_modify = F_M_dict[f'F_pred_{region}_modify']
+                M_pred_modify = F_M_dict[f'M_pred_{region}_modify']
+                F_truth = F_M_dict[f"F_truth_{region}"]
+                M_truth = F_M_dict[f"M_truth_{region}"]
+                F_pred = F_M_dict[f"F_pred_{region}"]
+                M_pred = F_M_dict[f"M_pred_{region}"]
+                F_mre_modify = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
+                    x=F_truth
+                )
+                M_mre_modify = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
+                    x=M_truth
+                )
 
-            sideslip_angle = calculate_lateral_angle(
-                data_dict["info"][0]["car_speed"], 
-                data_dict["info"][0]["wind_speed"], 
-                data_dict["info"][0]["wind_angle"]
-            )
-
-            case_coefficent_json_dict['type_value'] = sideslip_angle
-            case_coefficent_json_dict['car_speed'] = data_dict["info"][0]["car_speed"]
-            case_coefficent_json_dict['wind_speed'] = data_dict["info"][0]["wind_speed"]
-            case_coefficent_json_dict['wind_angle'] = data_dict["info"][0]["wind_angle"]
-
-
-            for load_name, values in load_types.items():
-                real_val = values['real'].numpy() if hasattr(values['real'], 'numpy') else values['real']
-                cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
-                cal_val_modify = values['pred_modify'].numpy() if hasattr(values['pred_modify'], 'numpy') else values['pred_modify']
-                cal_error = cal_val - real_val
-                cal_error_modify = cal_val_modify - real_val
-                case_coefficent_json_dict[load_name] = {
-                    'real_value': float(real_val),
-                    'cal_value': float(cal_val),
-                    #'cal_value_modify': float(cal_val_modify),
-                    'cal_error': float(cal_error),
-                    #'cal_error_modify': float(cal_error_modify),
+                load_types = {
+                    'aerodynamic_lift': {'real': F_M_dict[f'F_truth_{region}'][1], 'pred': F_M_dict[f'F_pred_{region}'][1], 'pred_modify': F_M_dict[f'F_pred_{region}_modify'][1]},
+                    'aerodynamic_drag': {'real': F_M_dict[f'F_truth_{region}'][0], 'pred': F_M_dict[f'F_pred_{region}'][0], 'pred_modify': F_M_dict[f'F_pred_{region}_modify'][0]},
+                    'pneumatic_lateral_force': {'real': F_M_dict[f'F_truth_{region}'][2], 'pred': F_M_dict[f'F_pred_{region}'][2], 'pred_modify': F_M_dict[f'F_pred_{region}_modify'][2]},
+                    'pneumatic_overturning_moment': {'real': F_M_dict[f"M_truth_{region}"][0], 'pred': F_M_dict[f"M_pred_{region}"][0], 'pred_modify': F_M_dict[f"M_pred_{region}_modify"][0]},
+                    'pneumatic_pitching_moment': {'real': F_M_dict[f"M_truth_{region}"][1], 'pred': F_M_dict[f"M_pred_{region}"][1], 'pred_modify': F_M_dict[f"M_pred_{region}_modify"][1]},
+                    'pneumatic_roll_moment': {'real': F_M_dict[f"M_truth_{region}"][2], 'pred': F_M_dict[f"M_pred_{region}"][2], 'pred_modify': F_M_dict[f"M_pred_{region}_modify"][2]},
                 }
 
-            caseid=datamodule.test_full_caseids[i]
-            append_dict_to_json_list(sideslip_filename[str(caseid)[:20]], case_coefficent_json_dict)
+                sideslip_angle = calculate_lateral_angle(
+                    data_dict["info"][0]["car_speed"], 
+                    data_dict["info"][0]["wind_speed"], 
+                    data_dict["info"][0]["wind_angle"]
+                )
 
-            msg += f"MRE_F_modify: {F_mre_modify.numpy()}, "
-            msg += f"[F_pred_modify: {F_pred_modify.numpy()}, "
-            msg += f"F_truth: {F_truth.numpy()}], "
-            msg += f"MRE_M_modify: {M_mre_modify.numpy()}, "
-            msg += f"[M_pred_modify: {M_pred_modify.numpy()}, "
-            msg += f"M_truth: {M_truth.numpy()}], "
+                case_coefficent_json_dict['carriage_number'] = region.split('_')[1]
+                case_coefficent_json_dict['type_value'] = sideslip_angle
+                case_coefficent_json_dict['car_speed'] = data_dict["info"][0]["car_speed"]
+                case_coefficent_json_dict['wind_speed'] = data_dict["info"][0]["wind_speed"]
+                case_coefficent_json_dict['wind_angle'] = data_dict["info"][0]["wind_angle"]
+
+
+                for load_name, values in load_types.items():
+                    real_val = values['real'].numpy() if hasattr(values['real'], 'numpy') else values['real']
+                    cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
+                    cal_val_modify = values['pred_modify'].numpy() if hasattr(values['pred_modify'], 'numpy') else values['pred_modify']
+                    cal_error = cal_val - real_val
+                    cal_error_modify = cal_val_modify - real_val
+                    case_coefficent_json_dict[load_name] = {
+                        'real_value': float(real_val),
+                        'cal_value': float(cal_val),
+                        #'cal_value_modify': float(cal_val_modify),
+                        'cal_error': float(cal_error),
+                        #'cal_error_modify': float(cal_error_modify),
+                    }
+
+                caseid=datamodule.test_full_caseids[i]
+                append_dict_to_json_list(sideslip_filename[str(caseid)[:-4]], case_coefficent_json_dict)
+
+                msg += f"MRE_F_modify: {F_mre_modify.numpy()}, "
+                msg += f"[F_pred_modify: {F_pred_modify.numpy()}, "
+                msg += f"F_truth: {F_truth.numpy()}], "
+                msg += f"MRE_M_modify: {M_mre_modify.numpy()}, "
+                msg += f"[M_pred_modify: {M_pred_modify.numpy()}, "
+                msg += f"M_truth: {M_truth.numpy()}], "
 
             logging.info(msg)
         
-            error_dict[full_indices[i][:-6]] += F_error.sum() + M_error.sum()
+            error_dict[full_indices[i][:-4]] += F_error.sum() + M_error.sum()
 
         max_loss_case_id = max(error_dict, key=error_dict.get)
         min_loss_case_id = min(error_dict, key=error_dict.get)
@@ -512,7 +513,7 @@ def train(cfg: DictConfig):
                     msg += f"Memory Usage: {memory_allocated:.2f} GB (forward), "
 
                 optimizer.clear_gradients(set_to_zero=False)
-                pred, truth, F_M_dict = model(
+                pred, truth, F_M_dict,region_masks = model(
                     data_dict, idx_batch, loss_fn=loss_fn, decode_fn=datamodule.decode
                 )
                 if "OOM" in F_M_dict:
@@ -553,29 +554,48 @@ def train(cfg: DictConfig):
 
                     loss += cfg.weight_list[i] * loss_key
             else:
-                F_pred_modify = F_M_dict["F_pred_modify"]
-                M_pred_modify = F_M_dict["M_pred_modify"]
-                F_truth = F_M_dict["F_truth"]
-                M_truth = F_M_dict["M_truth"]
-                F_pred = F_M_dict["F_pred"]
-                M_pred = F_M_dict["M_pred"]
-                F_mre_modify = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
-                    x=F_truth
-                )
-                M_mre_modify = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
-                    x=M_truth
-                )
-                F_mre = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(x=F_truth)
-                M_mre = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(x=M_truth)
+                for region, mask in region_masks.items():
+                    F_pred_modify = F_M_dict[f'F_pred_{region}_modify']
+                    M_pred_modify = F_M_dict[f'M_pred_{region}_modify']
+                    F_truth = F_M_dict[f"F_truth_{region}"]
+                    M_truth = F_M_dict[f"M_truth_{region}"]
+                    F_pred = F_M_dict[f"F_pred_{region}"]
+                    M_pred = F_M_dict[f"M_pred_{region}"]
+                    
+                    F_mre_modify = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(
+                        x=F_truth
+                    )
+                    M_mre_modify = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(
+                        x=M_truth
+                    )
+                    F_mre = paddle.abs(x=F_pred_modify - F_truth) / paddle.abs(x=F_truth)
+                    M_mre = paddle.abs(x=M_pred_modify - M_truth) / paddle.abs(x=M_truth)
 
-                
-                loss += 1.2*paddle.nn.functional.mse_loss(F_pred_modify[1], F_truth[1])
-                loss += 1.2*paddle.nn.functional.mse_loss(M_pred_modify[1], M_truth[1])
-                loss += 50*paddle.nn.functional.mse_loss(F_pred_modify[0], F_truth[0])
-                loss += 3.1*paddle.nn.functional.mse_loss(F_pred_modify[2], F_truth[2])
-                loss += 0.7*paddle.nn.functional.mse_loss(M_pred_modify[0], M_truth[0])
-                loss += 1.3*paddle.nn.functional.mse_loss(M_pred_modify[2], M_truth[2])
+                    loss += cfg.weight_F_M[2]*paddle.nn.functional.mse_loss(F_pred_modify[0], F_truth[0])
+                    loss += cfg.weight_F_M[0]*paddle.nn.functional.mse_loss(F_pred_modify[1], F_truth[1])
+                    loss += cfg.weight_F_M[3]*paddle.nn.functional.mse_loss(F_pred_modify[2], F_truth[2])
+                    
+                    loss += cfg.weight_F_M[4]*paddle.nn.functional.mse_loss(M_pred_modify[0], M_truth[0])
+                    loss += cfg.weight_F_M[1]*paddle.nn.functional.mse_loss(M_pred_modify[1], M_truth[1])
+                    loss += cfg.weight_F_M[5]*paddle.nn.functional.mse_loss(M_pred_modify[2], M_truth[2])
 
+                    train_l2_meter.update({"MSE_loss": loss.detach().item()})
+                    train_l2_meter.update({"F_mre": F_mre.numpy()})
+                    train_l2_meter.update({"M_mre": M_mre.numpy()})
+                    train_l2_meter.update({"F_pred": F_pred.numpy()})
+                    train_l2_meter.update({"M_pred": M_pred.numpy()})
+                    train_l2_meter.update(
+                        {"F_pred_modify": F_pred_modify.numpy()}
+                    )
+                    train_l2_meter.update({"M_pred_modify": M_pred_modify.numpy()})
+                    train_l2_meter.update({"F_truth": F_truth.numpy()})
+                    train_l2_meter.update({"M_truth": M_truth.numpy()})
+                    train_l2_meter.update({"aerodynamic_lift": F_mre.numpy()[1]})
+                    train_l2_meter.update({"aerodynamic_drag": F_mre.numpy()[0]})
+                    train_l2_meter.update({"pneumatic_lateral_force": F_mre.numpy()[2]})
+                    train_l2_meter.update({"pneumatic_overturning_moment": M_mre.numpy()[0]})
+                    train_l2_meter.update({"pneumatic_pitching_moment": M_mre.numpy()[1]})
+                    train_l2_meter.update({"pneumatic_roll_moment": M_mre.numpy()[2]})
 
                 train_l2_meter.update(
                     {"pressure": F_M_dict["L2_pressure"].detach().item()}
@@ -583,24 +603,6 @@ def train(cfg: DictConfig):
                 train_l2_meter.update(
                     {"wallshearstress": F_M_dict["L2_wallshearstress"].detach().item()}
                 )
-
-                train_l2_meter.update({"MSE_loss": loss.detach().item()})
-                train_l2_meter.update({"F_mre": F_mre.numpy()})
-                train_l2_meter.update({"M_mre": M_mre.numpy()})
-                train_l2_meter.update({"F_pred": F_pred.numpy()})
-                train_l2_meter.update({"M_pred": M_pred.numpy()})
-                train_l2_meter.update(
-                    {"F_pred_modify": F_pred_modify.numpy()}
-                )
-                train_l2_meter.update({"M_pred_modify": M_pred_modify.numpy()})
-                train_l2_meter.update({"F_truth": F_truth.numpy()})
-                train_l2_meter.update({"M_truth": M_truth.numpy()})
-                train_l2_meter.update({"aerodynamic_lift": F_mre.numpy()[1]})
-                train_l2_meter.update({"aerodynamic_drag": F_mre.numpy()[0]})
-                train_l2_meter.update({"pneumatic_lateral_force": F_mre.numpy()[2]})
-                train_l2_meter.update({"pneumatic_overturning_moment": M_mre.numpy()[0]})
-                train_l2_meter.update({"pneumatic_pitching_moment": M_mre.numpy()[1]})
-                train_l2_meter.update({"pneumatic_roll_moment": M_mre.numpy()[2]})
                 
 
             loss.backward(grad_tensor=loss)
@@ -724,8 +726,8 @@ def save_eval_results(
             output_dir,
             "csv_vtp",
             str(epoch_id),
-            f"{str(caseid)[:20]}",
-            f"{str(caseid)[21:]}",
+            f"{str(caseid)[:-4]}",
+            f"{str(caseid).split('-')[-1]}",
             f"{k}.csv",
         )
         os.makedirs(os.path.dirname(csv_filename), exist_ok=True)
@@ -736,8 +738,8 @@ def save_eval_results(
             output_dir,
             "csv_vtp",
             str(epoch_id),
-            f"{str(caseid)[:20]}",
-            f"{str(caseid)[21:]}",
+            f"{str(caseid)[:-4]}",
+            f"{str(caseid).split('-')[-1]}",
             f"{k}.vtp",
         )
         os.makedirs(os.path.dirname(vtp_filename), exist_ok=True)
