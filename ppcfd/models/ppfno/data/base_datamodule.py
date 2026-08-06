@@ -25,7 +25,8 @@ class BaseDataModule:
             sampler = DistributedBatchSampler(self.train_data,
                                               rank=get_rank(),
                                               shuffle=True,
-                                              batch_size=1)
+                                              batch_size=1,
+                                              drop_last=True)
             return paddle.io.DataLoader(self.train_data, batch_sampler=sampler, num_workers=0, collate_fn=collate_fn, **kwargs)
         else:
             return paddle.io.DataLoader(self.train_data, collate_fn=collate_fn, **kwargs)
@@ -36,7 +37,8 @@ class BaseDataModule:
             sampler = DistributedBatchSampler(self.val_data,
                                     rank=get_rank(),
                                     shuffle=True,
-                                    batch_size=1)
+                                    batch_size=1,
+                                    drop_last=True)
             return paddle.io.DataLoader(self.val_data, batch_sampler=sampler, num_workers=0, collate_fn=collate_fn, **kwargs)
         else:
             return paddle.io.DataLoader(self.val_data, collate_fn=collate_fn, **kwargs)

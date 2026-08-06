@@ -24,6 +24,9 @@ def instantiate_datamodule(
             lazy_loading=config.lazy_loading,
             train_ratio=train_ratio,
             test_ratio=test_ratio,
+            train_ids_path=getattr(config, "train_ids_path", None),
+            test_ids_path=getattr(config, "test_ids_path", None),
+            split_json_path=getattr(config, "split_json_path", None),
         )
     else:
         raise NotImplementedError(f"Unknown datamodule: {config.data_module}")

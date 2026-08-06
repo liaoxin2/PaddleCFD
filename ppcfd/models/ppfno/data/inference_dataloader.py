@@ -18,6 +18,7 @@ import paddle
 import math
 
 from .base_datamodule import BaseDataModule
+from .datamodule_lazy import compute_q_ref
 
 from ..neuralop.utils import UnitGaussianNormalizer
 
@@ -82,6 +83,7 @@ class PathDictDataset(paddle.io.Dataset, LoadFile):
         extension = ".pdparams"
         file_key = "info"
         return_dict["info"] = self.load_file(f"{file_key}_{file_index}", extension)
+        return_dict["info"]["car_speed"] = float(return_dict["info"]["car_speed"]) / 3.6
         return_dict["df"] = self.load_file(f"df_{file_index}")
         return_dict["df_query_points"] = paddle.to_tensor(data=self.query_points)
         return_dict["vertices"] = None
@@ -100,6 +102,13 @@ class PathDictDataset(paddle.io.Dataset, LoadFile):
         )
         return_dict["areas"] = areas
         return_dict["centroids_no_norms"] = centroids
+        # 参考动压：与 F_const 使用相同的合成来流速度定义，decode 时用于还原物理量。
+        # 推理时 wind_speed/wind_angle 可能为逗号串（多值扫描），此时无法直接求 q_ref；
+        # 真正的 q_ref 由推理循环在写回单个扫描值后重算，这里仅做占位、不让加载阶段崩溃。
+        try:
+            return_dict["q_ref"] = compute_q_ref(return_dict["info"])
+        except (ValueError, TypeError):
+            return_dict["q_ref"] = None
         for key in self.norms_dict:
             if key in return_dict:
                 return_dict[key] = self.norms_dict[key](return_dict[key])
@@ -139,9 +148,9 @@ class BaseCFDDataModule(BaseDataModule):
         norm_fn.to(data.place)
         return norm_fn.encode(data)
 
-    def decode(self, norm_fn, data: paddle.Tensor) -> paddle.Tensor:
+    def decode(self, norm_fn, data: paddle.Tensor, q_ref=None) -> paddle.Tensor:
         norm_fn.to(data.place)
-        return norm_fn.decode(data)
+        return norm_fn.decode(data, q_ref=q_ref)
 
     def load_bound(
         self, data_dir, filename="watertight_global_bounds.txt", eps=1e-06
@@ -275,9 +284,9 @@ class SAEInferenceDataModule(BaseCFDDataModule):
         min_bounds, max_bounds = self.load_bound(
             data_dir, filename="global_bounds.txt", eps=self.eps
         )
-        min_info_bounds, max_info_bounds = self.load_bound(
-            data_dir, filename="info_bounds.txt", eps=0.0
-        )
+        # min_info_bounds, max_info_bounds = self.load_bound(
+        #     data_dir, filename="info_bounds.txt", eps=0.0
+        # )
         min_area_bound, max_area_bound = self.load_bound(
             data_dir, filename="area_bounds.txt", eps=0.0
         )
@@ -294,9 +303,9 @@ class SAEInferenceDataModule(BaseCFDDataModule):
         location_norm_fn = lambda x: self.location_normalization(
             x, min_bounds, max_bounds
         )
-        info_norm_fn = lambda x: self.info_normalization(
-            x, min_info_bounds, max_info_bounds
-        )
+        # info_norm_fn = lambda x: self.info_normalization(
+        #     x, min_info_bounds, max_info_bounds
+        # )
         area_norm_fn = lambda x: self.area_normalization(
             x, min_area_bound[0], max_area_bound[0]
         )
@@ -313,7 +322,7 @@ class SAEInferenceDataModule(BaseCFDDataModule):
                 paddle.to_tensor(data=data), eps=1e-06, reduce_dim=[0], verbose=False
             )
 
-            mean_std_filename = f"train_{key}_mean_std.txt"
+            mean_std_filename = f"train_{key}_coef_mean_std.txt"
             mean, std = self.load_bound(data_dir, filename=mean_std_filename, eps=0.0)
             key_normalization.mean, key_normalization.std = paddle.to_tensor(
                 data=mean[: self.out_channels[i]]
@@ -341,8 +350,8 @@ class SAEInferenceDataModule(BaseCFDDataModule):
         data = np.load(file_path).astype(np.float32)
         return data
 
-    def decode(self, data, idx: int) -> paddle.Tensor:
-        return super().decode(self.output_normalization[idx], data.T).T
+    def decode(self, data, idx: int, q_ref=None) -> paddle.Tensor:
+        return super().decode(self.output_normalization[idx], data.T, q_ref=q_ref).T
 
     def collate_fn(self, batch):
         aggr_dict = {}

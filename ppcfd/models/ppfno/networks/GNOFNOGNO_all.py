@@ -239,7 +239,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
         area = data_dict["areas"][0]
 
         wind_angle = float(data_dict["info"][0]["wind_angle"])
-        car_speed = float(data_dict["info"][0]["car_speed"])
+        car_speed = float(data_dict["info"][0]["car_speed"])  # already m/s
         wind_speed = float(data_dict["info"][0]["wind_speed"])
 
         angle_field = wind_angle * paddle.ones_like(x=df).astype("float32")
@@ -258,6 +258,21 @@ class GNOFNOGNO_all(GNOFNOGNO):
     def build_region_masks(self, points, boundaries):
         x = points[:, 0]
         boundaries = paddle.to_tensor(boundaries)
+
+        x_min = x.min().item()
+        x_max = x.max().item()
+        b_min = boundaries.min().item()
+        b_max = boundaries.max().item()
+
+        if not (x_min <= b_min and b_max <= x_max):
+            boundaries = boundaries * 0.001
+            b_min = boundaries.min().item()
+            b_max = boundaries.max().item()
+            if not (x_min <= b_min and b_max <= x_max):
+                raise ValueError(
+                    f"boundaries [{b_min:.6f}, {b_max:.6f}] (after *0.001) still out of "
+                    f"x range [{x_min:.6f}, {x_max:.6f}]"
+                )
 
         masks = {}
 
@@ -299,7 +314,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
         results = {}
 
         for region, mask in region_masks.items():
-            r_rel = centroids - paddle.to_tensor(r0[int(region.split('_')[1])-1], dtype="float32")
+            r_rel = centroids - 0.001*paddle.to_tensor(r0[int(region.split('_')[1])-1], dtype="float32")
             
             F_r_truth = F_per_truth[mask]
             F_r_pred  = F_per_pred[mask]
@@ -320,6 +335,140 @@ class GNOFNOGNO_all(GNOFNOGNO):
             }
 
         return results
+
+    def phase1_fm_terms(self, data_dict, pred, indices, decode_fn):
+        """方案 A：Phase-1 阶段的「可微分区积分力/力矩」估计器。
+
+        与 eval_dict/cal_F_M(Phase-2, @no_grad, 全网格积分) 不同，本方法在
+        Phase-1 只有子采样点(x_in[::subsample_train][indices])可用，且 pred 仍带梯度、
+        直连 backbone。因此在子网格上做分区积分，再用「区域面积比」把部分积分放大为
+        整车物理积分的无偏估计，使 F_pred/M_pred 对 backbone 可导，从而让点头力矩等
+        积分量的误差梯度直接重塑场预测(而非只靠 Phase-2 的冻结-backbone 修正头)。
+
+        参数:
+          pred    : [n_sub, total_ch] 网络原始(归一化/系数)输出, 带梯度。
+          indices : 选中的子采样点在 strided 网格中的下标(与 forward 内一致)。
+          decode_fn: datamodule.decode, 期望 [ch, n] 输入并返回 [ch, n]。
+        返回:
+          (terms, sub_masks)。terms[region] = {F_pred,F_truth,M_pred,M_truth}(物理空间,
+          F_pred/M_pred 可导, *_truth 为常量)。
+        """
+        r0 = json.loads(data_dict["info"][0]["reference_point"])
+        q_ref = data_dict["q_ref"][0]
+
+        normals_full = data_dict["triangle_normals"][0]            # (Nf,3)
+        areas_full = data_dict["areas"][0].reshape([-1, 1])        # (Nf,1)
+        cent_full = data_dict["centroids_no_norms"][0]             # (Nf,3)
+        n_full = cent_full.shape[0]
+
+        # 子采样点在整网格中的绝对行号(与 forward 的 x_in[::subsample_train][indices] 对齐)
+        strided = paddle.arange(0, n_full, self.subsample_train)
+        abs_idx = strided[indices]
+        normals_s = normals_full[abs_idx]                          # (n_sub,3)
+        areas_s = areas_full[abs_idx]                              # (n_sub,1)
+        cent_s = cent_full[abs_idx]                                # (n_sub,3)
+
+        # 区域划分：在整网格上算 mask 再按 abs_idx 取子集，保证与 Phase-2 边界处理一致
+        coordinate = data_dict["info"][0]["carriage_offset"]
+        if coordinate is not None and "," in coordinate:
+            value_list = [float(v) for v in coordinate.split(",")]
+            full_masks = self.build_region_masks(cent_full, value_list)
+        elif coordinate is not None:
+            value_list = [float(coordinate)]
+            full_masks = self.build_region_masks(cent_full, value_list)
+        else:
+            full_masks = {
+                "carriage_1": paddle.ones([n_full], dtype=paddle.bool)
+            }
+        sub_masks = {r: m[abs_idx] for r, m in full_masks.items()}
+
+        pred_t = pred.transpose(perm=[1, 0])                       # [total_ch, n_sub]
+
+        # 预解码各通道的物理单元力(traction * area)，pred 带梯度、truth 为常量
+        Fper_pred_keys = []
+        Fper_truth_keys = []
+        for i in range(len(self.out_keys)):
+            key = self.out_keys[i]
+            st = sum(self.out_channels[:i])
+            end = st + self.out_channels[i]
+            pred_key = pred_t[st:end, :]                           # [ch, n_sub]
+            truth_key = data_dict[key][0][abs_idx]
+            if len(tuple(truth_key.shape)) == 1:
+                truth_key = truth_key.reshape([-1, 1])
+            truth_key = truth_key[:, : self.out_channels[i]].transpose(perm=[1, 0])
+            pred_dec = decode_fn(pred_key, i, q_ref=q_ref)         # [ch, n_sub]
+            truth_dec = decode_fn(truth_key, i, q_ref=q_ref)
+            if key == "pressure":
+                tr_pred = -pred_dec.reshape([-1, 1]) * normals_s   # (n_sub,3)
+                tr_truth = -truth_dec.reshape([-1, 1]) * normals_s
+            elif key == "wallshearstress":
+                tr_pred = -pred_dec.T
+                tr_truth = -truth_dec.T
+            else:
+                raise ValueError(f"Unknown key: {key}")
+            Fper_pred_keys.append(tr_pred * areas_s)               # (n_sub,3)
+            Fper_truth_keys.append(tr_truth * areas_s)
+
+        Fper_pred = sum(Fper_pred_keys)                            # (n_sub,3) 可导
+        Fper_truth = sum(Fper_truth_keys)
+
+        terms = {}
+        kept_masks = {}
+        # 力臂加权场损失(建议 B): 每个子采样点到其所属车厢力矩参考点的纵向距离,
+        # 按该车厢半长归一化到 O(1)。俯仰力矩误差 δM_y ≈ Σ r_x·n_z·A·δp 被长力臂
+        # 放大, 故上层可用 w=1+α·lever_dist 加重车厢端部点的场损失。
+        lever_dist = paddle.zeros([cent_s.shape[0]], dtype="float32")
+        for region in sub_masks:
+            m_s = sub_masks[region]
+            # 该区域在子采样网格上无点时跳过, 否则 a_sub≈0 会放大出虚假的 0 预测损失。
+            if int(m_s.astype("int64").sum()) == 0:
+                continue
+            ridx = int(region.split("_")[1]) - 1
+            r0_r = 0.001 * paddle.to_tensor(r0[ridx], dtype="float32")
+            rrel = cent_s - r0_r                                   # (n_sub,3)
+
+            # 该车厢纵向半长(整网格上统计, 与子采样无关), 用于力臂归一化
+            x_region = cent_full[full_masks[region]][:, 0]
+            half_len = (x_region.max() - x_region.min()) / 2.0
+            d_all = (paddle.abs(rrel[:, 0]) / (half_len + 1e-12)).clip(0.0, 2.0)
+            lever_dist = paddle.where(m_s, d_all, lever_dist)
+
+            # 面积比: 用整网格该区域面积 / 子采样该区域面积, 把部分积分放大为全量无偏估计
+            a_full = areas_full[full_masks[region]].sum()
+            a_sub = areas_s[m_s].sum()
+            factor = a_full / (a_sub + 1e-12)
+
+            Fp = Fper_pred[m_s]
+            Ft = Fper_truth[m_s]
+            rr = rrel[m_s]
+
+            F_pred = Fp.sum(axis=0) * factor
+            F_truth = Ft.sum(axis=0) * factor
+            # 显式分量叉乘 r×F 求合力矩(再对点求和), 规避本环境 paddle.cross 反向
+            # 在 CrossGradKernel 处段错误(SIGSEGV)的问题; 数值与 paddle.cross 完全一致。
+            rx, ry, rz = rr[:, 0], rr[:, 1], rr[:, 2]
+            fpx, fpy, fpz = Fp[:, 0], Fp[:, 1], Fp[:, 2]
+            ftx, fty, ftz = Ft[:, 0], Ft[:, 1], Ft[:, 2]
+            M_pred = paddle.stack([
+                (ry * fpz - rz * fpy).sum(),
+                (rz * fpx - rx * fpz).sum(),
+                (rx * fpy - ry * fpx).sum(),
+            ]) * factor
+            M_truth = paddle.stack([
+                (ry * ftz - rz * fty).sum(),
+                (rz * ftx - rx * ftz).sum(),
+                (rx * fty - ry * ftx).sum(),
+            ]) * factor
+
+            terms[region] = {
+                "F_pred": F_pred,
+                "F_truth": F_truth,
+                "M_pred": M_pred,
+                "M_truth": M_truth,
+            }
+            kept_masks[region] = m_s
+
+        return terms, kept_masks, lever_dist
 
 
     @paddle.no_grad()
@@ -393,8 +542,11 @@ class GNOFNOGNO_all(GNOFNOGNO):
             pred_key = pred[st:end, :]
             out_dict[f"L2_{key}"] = loss_fn(pred_key, truth_key)
             if decode_fn is not None:
-                pred_decode = decode_fn(pred_key, i)
-                truth_decode = decode_fn(truth_key, i)
+                # 网络输出/标签均在「z-score(系数)」空间，decode 需传入 q_ref
+                # 先反 z-score 得到 Cp/Cf，再乘 q_ref 还原物理量(p/τ)，方可积分气动力。
+                q_ref = data_dict["q_ref"][0]
+                pred_decode = decode_fn(pred_key, i, q_ref=q_ref)
+                truth_decode = decode_fn(truth_key, i, q_ref=q_ref)
                 
                 
                 if region_masks is not None:
@@ -500,7 +652,9 @@ class GNOFNOGNO_all(GNOFNOGNO):
             )
             pred_key = pred[st:end, :]
             if decode_fn is not None:
-                pred_decode = decode_fn(pred_key, i)
+                # 推理时同样需用 q_ref 还原物理量(decode: 反 z-score -> 乘 q_ref)
+                q_ref = data_dict["q_ref"][0]
+                pred_decode = decode_fn(pred_key, i, q_ref=q_ref)
                 r0 = data_dict["info"][0]["reference_point"]
                 r0 = json.loads(r0)
                 triangle_normals = data_dict["triangle_normals"][0] 
@@ -514,7 +668,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
                     F_r_pred  = F_per_pred[mask]
                     F_total_pred = F_r_pred.sum(axis=0)   # (3,)
                     # 力矩（关于 r0）： sum( (r_i - r0) x F_i )
-                    r_rel = centroids - paddle.to_tensor(r0, dtype="float32") # (N,3)
+                    r_rel = centroids - 0.001*paddle.to_tensor(r0, dtype="float32") # (N,3)
                     r_rel = r_rel[mask]
                     M_per_pred = paddle.cross(r_rel, F_r_pred)
                     M_total_pred = M_per_pred.sum(axis=0)
@@ -524,7 +678,7 @@ class GNOFNOGNO_all(GNOFNOGNO):
                     F_r_pred  = F_per_pred[mask]
                     F_total_pred = F_r_pred.sum(axis=0)
 
-                    r_rel = centroids - paddle.to_tensor(r0, dtype="float32") # (N,3)
+                    r_rel = centroids - 0.001*paddle.to_tensor(r0, dtype="float32") # (N,3)
                     r_rel = r_rel[mask]
                     M_per_pred = paddle.cross(r_rel, F_r_pred)
                     M_total_pred = M_per_pred.sum(axis=0)
@@ -545,6 +699,19 @@ class GNOFNOGNO_all(GNOFNOGNO):
         F_M_dict.update({"F_wallshearstress_pred": out_dict["F_wallshearstress_pred"]})
         F_M_dict.update({"M_pressure_pred": out_dict["M_pressure_pred"]})
         F_M_dict.update({"M_wallshearstress_pred": out_dict["M_wallshearstress_pred"]})
+        mass_density = float(data_dict["info"][0]["density"])
+        reference_area = float(data_dict["info"][0]["area"])
+        typical_length = float(data_dict["info"][0]["typical_length"])
+        car_speed = float(data_dict["info"][0]["car_speed"])  # already m/s
+        wind_speed = float(data_dict["info"][0]["wind_speed"])
+        wind_angle_rad = math.radians(float(data_dict["info"][0]["wind_angle"]))
+        vx = car_speed + wind_speed * math.cos(wind_angle_rad)
+        vy = wind_speed * math.sin(wind_angle_rad)
+        flow_speed = math.sqrt(vx**2 + vy**2)
+        F_const = 2.0 / (mass_density * flow_speed**2 * reference_area)
+        M_const = 2.0 / (mass_density * flow_speed**2 * reference_area * typical_length)
+        F_M_dict.update({"F_const": F_const})
+        F_M_dict.update({"M_const": M_const})
         F_M_dict = self.integral_cd(F_M_dict, out_keys=self.out_keys)
 
         return out_dict, pred, F_M_dict
@@ -588,6 +755,25 @@ class GNOFNOGNO_all(GNOFNOGNO):
             # paddle.device.cuda.empty_cache()  # clear GPU memory
 
         F_M_dict = {}
+        # 方案 A: Phase-1(backbone 可训, integral_cd 冻结)时, 若开启 phase1_fm_loss_w,
+        # 计算可微分区积分力/力矩并写入 F_M_dict, 供 train.py 追加积分损失(梯度直达 backbone)。
+        if (
+            self.integral_cd.parameters()[0].stop_gradient == True
+            and float(getattr(self, "phase1_fm_loss_w", 0.0)) > 0.0
+            and decode_fn is not None
+        ):
+            terms, region_masks, lever_dist = self.phase1_fm_terms(
+                data_dict, pred, indices, decode_fn
+            )
+            F_M_dict.update({"mode": "phase1"})
+            # 力臂加权场损失: 子采样点(与 pred 行对齐)的归一化纵向力臂, detach 为常量权重
+            F_M_dict.update({"lever_dist": lever_dist.detach()})
+            for region, v in terms.items():
+                F_M_dict[f"F_pred_{region}"] = v["F_pred"]
+                F_M_dict[f"F_truth_{region}"] = v["F_truth"]
+                F_M_dict[f"M_pred_{region}"] = v["M_pred"]
+                F_M_dict[f"M_truth_{region}"] = v["M_truth"]
+
         if self.integral_cd.parameters()[0].stop_gradient == False:
             # cd_dict = self.integral_cd(pred, truth, self.out_channels,
             #    data_dict, decode_fn=decode_fn,
@@ -605,6 +791,8 @@ class GNOFNOGNO_all(GNOFNOGNO):
                     F_M_dict.update({f"M_pred_{region}": F_M_dict[f"M_pressure_{region}_pred"]+F_M_dict[f"M_wallshearstress_{region}_pred"]})
                     F_M_dict.update({f"F_truth_{region}": F_M_dict[f"F_pressure_{region}_truth"]+F_M_dict[f"F_wallshearstress_{region}_truth"]})
                     F_M_dict.update({f"M_truth_{region}": F_M_dict[f"M_pressure_{region}_truth"]+F_M_dict[f"M_wallshearstress_{region}_truth"]})
+                F_M_dict.update({"F_const": data_dict["F_const"][0]})
+                F_M_dict.update({"M_const": data_dict["M_const"][0]})
                 F_M_dict = self.integral_cd(F_M_dict, region_masks, self.out_keys)
 
             except MemoryError as e:

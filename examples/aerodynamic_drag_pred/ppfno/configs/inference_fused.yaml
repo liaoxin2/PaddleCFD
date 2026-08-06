@@ -30,48 +30,32 @@ sdf_spatial_resolution: [64, 64, 64] # or [64, 64, 64]
 
 # data
 data_module: SAE
-n_train_num: 166 # 862
-n_val_num: 1 # 
-n_test_num: 20 # 166
 n_inference_num: 1
-only_save_sdf: false  # generate sdf&closest_points or training
-lazy_loading: true  # load all data into memory or not
+lazy_loading: true
 
 # settings
-enable_ddp: true
-devices: [1, 2]  # python -m paddle.distributed.launch --gpus=6 train.py
+# NOTE: enable_ddp is ignored by the fused pipeline; inference always runs single-process.
+enable_ddp: false
 seed: 0
-lr: 0.0003 # 0.0005
-weight_list: [20.0, 10.0] # [20.0, 1.0]
 batch_size: 1
-num_epochs: 60 # 1000
-finetuning_epochs: 51
-output_dir: ${hydra:run.dir}
-# mode: "train"  # train, test
-mode: "inference"
-# state: /home/checkpoint/GNOFNOGNO_all.pdparams  # null
-save_per_epoch: 20
+mode: "inference_fused"
 save_eval_results: true
-resume_ep: -1
+subsample_eval_out: 1
 reference_point: [-3.20625,0,0]
-optimizer: "SOAP" # AdamW or SOAP
 
-# Finetuning
+# Finetuning (kept for network instantiation parity with train/inference)
 lr_cd: 0.01
 layers: [2,64,128,64,1]
 weight_F_M: [20,1,1,1,1,1]
-# 各物理量全局特征尺度(物理空间 RMS)，需与训练时一致(自动读取 force_moment_scale.json)。
-# 此处仅为回退默认。scale_F: [drag, lift, lateral]; scale_M: [overturning, pitching, roll]
 scale_F: [86.94, 738.31, 617.42]
 scale_M: [152.09, 196.60, 276.78]
 eps_rel: 0.05
 sign_penalty_w: 0.3
 delta_reg_lambda: 0.01
 
-# inference params
-state: null
-pd_path: null
-reason_input_path: null
-reason_output_path: null
-pre_output_path: null
-# gpu: null
+# fused inference params
+state: null                 # path to checkpoint .pdparams (required)
+pre_input_path: null        # root dir; each sub-dir is a case containing {caseid}.stl + {caseid}.json
+reason_output_path: null    # output root; one sub-dir per case
+bounds_dir: null            # dir with global_bounds.txt / area_bounds.txt / train_{key}_coef_mean_std.txt
+preprocess_workers: 1       # >1 enables parallel preprocessing via a spawn ProcessPool

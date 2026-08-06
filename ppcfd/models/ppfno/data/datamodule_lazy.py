@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import os
 import random
@@ -24,6 +25,26 @@ from ..neuralop.utils import UnitGaussianNormalizer
 
 def get_last_dir(path):
     return os.path.basename(os.path.normpath(path))
+
+
+def compute_q_ref(info):
+    """计算样本参考动压 q_ref = 0.5 * rho * flow_speed**2。
+
+    flow_speed 为合成来流速度，与 F_const/M_const 使用完全相同的定义，
+    保证 F_const == 1/(q_ref * reference_area)。
+
+    注意：info["car_speed"] 在数据加载时已统一转换为 m/s（/3.6），
+    此函数假定传入的 car_speed 已是 m/s。
+    """
+    mass_density = float(info["density"])
+    car_speed = float(info["car_speed"])  # m/s
+    wind_speed = float(info["wind_speed"])
+    wind_angle_rad = math.radians(float(info["wind_angle"]))
+    vx = car_speed + wind_speed * math.cos(wind_angle_rad)
+    vy = wind_speed * math.sin(wind_angle_rad)
+    flow_speed = math.sqrt(vx**2 + vy**2)
+    q_ref = 0.5 * mass_density * flow_speed**2
+    return q_ref
 
 
 class LoadMesh:
@@ -177,6 +198,7 @@ class PathDictDataset(paddle.io.Dataset, LoadMesh, LoadFile):
         indices: Optional[List[str]] = None,
         norms_dict: Optional[Dict[str, Callable]] = {},
         data_keys: Optional[List[str]] = ["info", "pressure", "wallshearstress"],
+        out_keys: Optional[List[str]] = ["pressure", "wallshearstress"],
         lazy_loading=True,
     ):
         LoadMesh.__init__(self, path, query_points, closest_points_to_query)
@@ -186,6 +208,8 @@ class PathDictDataset(paddle.io.Dataset, LoadMesh, LoadFile):
         self.indices = indices
         self.norms_dict = norms_dict
         self.data_keys = data_keys
+        # 输出物理场的 key（pressure/wallshearstress），这些 key 需要按 q_ref 做系数归一化
+        self.out_keys = out_keys
         self.lazy_loading = lazy_loading
         if not self.lazy_loading:
             self.all_return_dict = [self.get_item(i) for i in range(len(self.indices))]
@@ -240,18 +264,32 @@ class PathDictDataset(paddle.io.Dataset, LoadMesh, LoadFile):
         flow_directions = paddle.zeros_like(x=triangle_normals)
         flow_directions[:, 0] = -1
         mass_density = return_dict["info"]["density"]
-        flow_speed = math.sqrt(return_dict["info"]["car_speed"]**2 + return_dict["info"]["wind_speed"]**2)
+        return_dict["info"]["car_speed"] = float(return_dict["info"]["car_speed"]) / 3.6
+        car_speed = float(return_dict["info"]["car_speed"])
+        wind_speed = float(return_dict["info"]["wind_speed"])
+        wind_angle_rad = math.radians(float(return_dict["info"]["wind_angle"]))
+        vx = car_speed + wind_speed * math.cos(wind_angle_rad)
+        vy = wind_speed * math.sin(wind_angle_rad)
+        flow_speed = math.sqrt(vx**2 + vy**2)
         const = 2.0 / (mass_density * flow_speed**2 * reference_area)
         projection = paddle.sum(
             x=(triangle_normals  * 1e10) * flow_directions, axis=1, keepdim=False
         )
         return_dict["F_const"] = 2.0 / (mass_density * flow_speed**2 * reference_area)
-        return_dict["M_const"] = 2.0 / (mass_density * flow_speed**2 * reference_area * 0.3)
+        return_dict["M_const"] = 2.0 / (mass_density * flow_speed**2 * reference_area * float(return_dict["info"]['typical_length']))
+        # 参考动压：q_ref = 0.5*rho*flow_speed**2，满足 F_const == 1/(q_ref*reference_area)
+        q_ref = compute_q_ref(return_dict["info"])
+        return_dict["q_ref"] = q_ref
         return_dict["areas"] = areas
         return_dict["centroids_no_norms"] = centroids
+        # 输出物理场(pressure/wallshearstress)先除以 q_ref 转为系数(Cp/Cf)，再 z-score。
+        # 其它 key(如 area/location)走纯归一化，不传 q_ref。
         for key in self.norms_dict:
             if key in return_dict:
-                return_dict[key] = self.norms_dict[key](return_dict[key])
+                if key in self.out_keys:
+                    return_dict[key] = self.norms_dict[key](return_dict[key], q_ref=q_ref)
+                else:
+                    return_dict[key] = self.norms_dict[key](return_dict[key])
         if "location" in self.norms_dict:
             if return_dict["vertices"] is not None:
                 return_dict["vertices"] = self.norms_dict["location"](vertices)
@@ -300,9 +338,9 @@ class BaseCFDDataModule(BaseDataModule):
         norm_fn.to(data.place)
         return norm_fn.encode(data)
 
-    def decode(self, norm_fn, data: paddle.Tensor) -> paddle.Tensor:
+    def decode(self, norm_fn, data: paddle.Tensor, q_ref=None) -> paddle.Tensor:
         norm_fn.to(data.place)
-        return norm_fn.decode(data)
+        return norm_fn.decode(data, q_ref=q_ref)
 
     def load_bound(
         self, data_dir, filename="watertight_global_bounds.txt", eps=1e-06
@@ -367,6 +405,9 @@ class SAEDataModule(BaseCFDDataModule):
         lazy_loading=True,
         train_ratio: float = None,
         test_ratio: float = None,
+        train_ids_path: Optional[str] = None,
+        test_ids_path: Optional[str] = None,
+        split_json_path: Optional[str] = None,
     ):
         super().__init__()
         if isinstance(data_dir, str):
@@ -384,6 +425,9 @@ class SAEDataModule(BaseCFDDataModule):
         self.lazy_loading = lazy_loading
         self.train_ratio = train_ratio
         self.test_ratio = test_ratio
+        self.train_ids_path = Path(train_ids_path) if train_ids_path else None
+        self.test_ids_path = Path(test_ids_path) if test_ids_path else None
+        self.split_json_path = Path(split_json_path) if split_json_path else None
         self.get_indices(n_train, n_val, n_test)
         self.get_norms(data_dir)
         self.get_data()
@@ -399,7 +443,7 @@ class SAEDataModule(BaseCFDDataModule):
             raise ValueError("train_ratio和test_ratio之和必须为1.0")
 
         # 随机打乱输入列表
-        random.shuffle(input_list)
+        random.Random(42).shuffle(input_list)
 
         # 计算训练集的大小
         train_size = int(len(input_list) * train_ratio)
@@ -411,43 +455,34 @@ class SAEDataModule(BaseCFDDataModule):
         return train_list, test_list
 
     def load_ids(self, idx_path: str):
-        idx_str_lst = []
+        indices = []
+        full_caseids = []
         with open(idx_path, "r") as file:
             line = file.readline()
             while line:
                 line = line.strip()
-                idx_str_lst.append(line.split("_")[-1])
+                new_index = line.rsplit("-", 1)[0]
+                if new_index not in indices:
+                    indices.append(new_index)
+                full_caseids.append(line)
                 line = file.readline()
-        return idx_str_lst
+        return indices, full_caseids
 
-    def init_idx(self, n_data, mode, filename) -> List[str]:
-        idx_path = self.data_dir / filename
+    def init_idx(self, n_data, mode=None, idx_file: Optional[Path] = None) -> List[str]:
+        idx_path = idx_file if idx_file is not None else self.data_dir / f"{mode}_design_ids.txt"
         if idx_path.exists():
-            indices = self.load_ids(idx_path)
-            paddle.sort(x=indices), paddle.argsort(x=indices)
-            assert n_data <= len(
-                indices
-            ), f"only {len(indices)} meshes are available, but {n_data} are requested."
-            indices = indices[:n_data]
-        else:
-            # all_files = os.listdir(self.data_dir / mode)
-            all_files = os.listdir(self.data_dir)
-            all_files = [file for file in all_files if file.endswith(".npy")]
-            prefix = "area"
-            indices = [item[5:-8] for item in all_files if item.startswith(prefix)]
-
-            def extract_number(s):
-                return int(s)
-
-            def extract_number2(s):
-                return int(s[0:4])
-
+            indices, full_caseids = self.load_ids(idx_path)
             indices.sort()
             indices = indices[:n_data]
-            indices = list(set(indices))
-            full_caseids = os.listdir(self.data_dir)
-            full_caseids = [d for d in full_caseids if os.path.isdir(os.path.join(self.data_dir, d))]
-            full_caseids.sort()
+            full_caseids = full_caseids[:n_data]
+        else:
+            all_files = sorted(os.listdir(self.data_dir))
+            all_files = [file for file in all_files if file.endswith(".npy")]
+            prefix = "area"
+            indices = sorted(set([item[5:-8] for item in all_files if item.startswith(prefix)]))
+            indices = indices[:n_data]
+
+            full_caseids = sorted([item[5:-4] for item in all_files if item.startswith(prefix)])
             full_caseids = full_caseids[:n_data]
             # print('indices_%s:' % mode, indices)
         return indices, full_caseids
@@ -462,43 +497,65 @@ class SAEDataModule(BaseCFDDataModule):
             indices=indices,
             norms_dict=self.norms_dict,
             data_keys=data_keys,
+            out_keys=self.out_keys,
             lazy_loading=self.lazy_loading,
         )
         return data_dict
 
     def get_indices(self, n_train, n_val, n_test):
-        if self.train_ratio is None:
-            self.train_indices, self.train_full_caseids = self.init_idx(n_train, "train", "train_design_ids.txt")
-            self.test_indices, self.test_full_caseids = self.init_idx(n_test, "test", "test_design_ids.txt")
+        if self.split_json_path is not None:
+            # 直接复用预训练保存的 radius.json 划分，保证微调与预训练完全一致。
+            # radius.json 仅存 design 级 index（train_case_id / test_case_id），
+            # full_caseids 需从数据目录重建（与随机划分分支同样的映射: case[:-4] -> index）。
+            logging.info(f"Use split from json: {self.split_json_path}.")
+            assert self.split_json_path.exists(), f"split_json not found: {self.split_json_path}"
+            with open(self.split_json_path, "r") as f:
+                split = json.load(f)
+            self.train_indices = list(split["train_case_id"])
+            self.test_indices = list(split["test_case_id"])
+
+            _, full_caseids = self.init_idx(n_train + n_val + n_test)
+            train_set, test_set = set(self.train_indices), set(self.test_indices)
+            self.train_full_caseids, self.test_full_caseids = [], []
+            for case in full_caseids:
+                if case[:-4] in train_set:
+                    self.train_full_caseids.append(case)
+                elif case[:-4] in test_set:
+                    self.test_full_caseids.append(case)
+        elif self.train_ids_path is not None and self.test_ids_path is not None:
+            logging.info(f"Use the specified dataset: {self.train_ids_path} and {self.test_ids_path}.")
+            self.train_indices, self.train_full_caseids = self.init_idx(n_train, "train", self.train_ids_path)
+            self.test_indices, self.test_full_caseids = self.init_idx(n_test, "train", self.test_ids_path)
         else:
-            self.train_indices, full_caseids = self.init_idx(n_train, "train", "train_design_ids.txt")
-            index = list(range(len(self.train_indices)))
+            logging.info(f"Random generate dataset.")
+            fulldata = n_train + n_val + n_test
+            full_indices, full_caseids = self.init_idx(fulldata)
+            index = list(range(len(full_indices)))
             train_index, test_index = self.split_list_(
                 index, train_ratio=self.train_ratio, test_ratio=self.test_ratio
             )
             self.train_indices, self.test_indices = (
-                [self.train_indices[j] for j in train_index],
-                [self.train_indices[k] for k in test_index],
+                [full_indices[j] for j in train_index],
+                [full_indices[k] for k in test_index],
             )
-            # self.train_indices = ['SFE-CR45AF-U3-FZ-002']
-            # self.test_indices = ['SFE-CR45AF-U3-FZ-003']
-            
+
             self.train_full_caseids, self.test_full_caseids = [], []
             for case in full_caseids:
                 if case[:-4] in self.train_indices:
                     self.train_full_caseids.append(case)
                 else:
                     self.test_full_caseids.append(case)
-            
-            print(self.train_full_caseids, self.test_full_caseids)
+
+        print('indices',self.train_indices, self.test_indices)
+        print('full_caseids',self.train_full_caseids, self.test_full_caseids)
 
     def get_norms(self, data_dir):
         min_bounds, max_bounds = self.load_bound(
             data_dir, filename="global_bounds.txt", eps=self.eps
         )
-        min_info_bounds, max_info_bounds = self.load_bound(
-            data_dir, filename="info_bounds.txt", eps=0.0
-        )
+        # min_info_bounds, max_info_bounds = self.load_bound(
+        #     data_dir, filename="info_bounds.txt", eps=0.0
+        # )
         min_area_bound, max_area_bound = self.load_bound(
             data_dir, filename="area_bounds.txt", eps=0.0
         )
@@ -529,7 +586,8 @@ class SAEDataModule(BaseCFDDataModule):
                 file_path = data_dir / f"pressure_{self.train_full_caseids[0]}.npy"
             elif key == "wallshearstress":
                 file_path = data_dir / f"wallshearstress_{self.train_full_caseids[0]}.npy"
-            mean_std_filename = f"train_{key}_mean_std.txt"
+            # mean/std 描述的是系数(Cp/Cf)的统计量，由预处理写入 *_coef_mean_std.txt
+            mean_std_filename = f"train_{key}_coef_mean_std.txt"
             key_normalization = UnitGaussianNormalizer(
                 paddle.to_tensor(data=self.load_file(file_path)),
                 eps=1e-06,
@@ -553,8 +611,8 @@ class SAEDataModule(BaseCFDDataModule):
         data = np.load(file_path).astype(np.float32)
         return data
 
-    def decode(self, data, idx: int) -> paddle.Tensor:
-        return super().decode(self.output_normalization[idx], data.T).T
+    def decode(self, data, idx: int, q_ref=None) -> paddle.Tensor:
+        return super().decode(self.output_normalization[idx], data.T, q_ref=q_ref).T
 
     def collate_fn(self, batch):
         aggr_dict = {}

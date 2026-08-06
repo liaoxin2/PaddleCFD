@@ -34,12 +34,16 @@ class UnitGaussianNormalizer:
                 f'   Mean and std of shape {tuple(self.mean.shape)}, eps={eps}'
                 )
 
-    def encode(self, x):
+    def encode(self, x, q_ref=None):
+        # 系数归一化：先除以参考动压 q_ref 得到无量纲系数(Cp/Cf)，再做 z-score。
+        # q_ref=None 时退化为纯 z-score（向后兼容）。
+        if q_ref is not None:
+            x = x / q_ref
         x -= self.mean
         x /= self.std + self.eps
         return x
 
-    def decode(self, x, sample_idx=None):
+    def decode(self, x, sample_idx=None, q_ref=None):
         if sample_idx is None:
             std = self.std + self.eps
             mean = self.mean
@@ -52,6 +56,9 @@ class UnitGaussianNormalizer:
                 mean = self.mean[:, sample_idx]
         x *= std
         x += mean
+        # 反 z-score 后再乘回参考动压，还原物理量(p/τ)。顺序与 encode 相反。
+        if q_ref is not None:
+            x = x * q_ref
         return x
 
     def cuda(self):

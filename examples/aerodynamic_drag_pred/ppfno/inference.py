@@ -23,6 +23,7 @@ from paddle.io import DataLoader
 from paddle.io import DistributedBatchSampler
 
 from ppcfd.models.ppfno.data import instantiate_inferencedatamodule
+from ppcfd.models.ppfno.data.datamodule_lazy import compute_q_ref
 from ppcfd.models.ppfno.losses import LpLoss
 from ppcfd.models.ppfno.networks import instantiate_network
 from ppcfd.models.ppfno.optim.schedulers import instantiate_scheduler
@@ -92,9 +93,9 @@ def save_vtp_from_dict(
 
         if num_timestamps > 1:
             width = len(str(num_timestamps - 1))
-            point_cloud.save(f"{filename}_t-{t:0{width}}.vtp")
+            point_cloud.save(f"{filename}_t-{t:0{width}}.vtp", binary=True)
         else:
-            point_cloud.save(f"{filename}.vtp")
+            point_cloud.save(f"{filename}.vtp", binary=True)
 
     if num_timestamps > 1:
         logging.info(
@@ -202,7 +203,11 @@ def inference(cfg: DictConfig):
                 data_dict['info'][0]['wind_angle'] = value
                 inference_json_dict['type'] = 'wind_angle'
 
-            
+            # 扫描值已写回 info，须基于当前 wind 值重算 q_ref，
+            # 保证 decode 用的 q_ref 与积分用的 F_const 满足 F_const == 1/(q_ref*A)。
+            data_dict["q_ref"] = [compute_q_ref(data_dict["info"][0])]
+
+
             device = ParallelEnv().device_id
             device = paddle.CUDAPlace(device)
             try:
@@ -221,6 +226,7 @@ def inference(cfg: DictConfig):
                         datamodule.inference_indices[0],
                         datamodule.inference_full_caseids[0],
                         decode_fn=datamodule.decode,
+                        q_ref=data_dict["q_ref"][0],
                     )
                 # paddle.device.cuda.empty_cache()
             except MemoryError as e:
@@ -238,8 +244,9 @@ def inference(cfg: DictConfig):
                     eval_meter.update({k: v})
             msg += f"|| MRE and Value: "
 
-            F_pred_modify = F_M_dict["F_pred_modify"]
-            M_pred_modify = F_M_dict["M_pred_modify"]
+            # 真·系数空间：F_pred_modify/M_pred_modify 为无量纲系数，折回物理力/力矩用于日志
+            F_pred_modify = F_M_dict["F_pred_modify"] / F_M_dict["F_const"]
+            M_pred_modify = F_M_dict["M_pred_modify"] / F_M_dict["M_const"]
             F_pred = out_dict["F_pred"]
             M_pred = out_dict["M_pred"]
             eval_meter.update({"F_pred_modify": F_pred_modify})
@@ -256,6 +263,14 @@ def inference(cfg: DictConfig):
                 'pneumatic_pitching_moment': {'pred': F_M_dict['M_pred'][1]},
                 'pneumatic_roll_moment': {'pred': F_M_dict['M_pred'][2]},
             }
+            load_types_modify = {
+                'aerodynamic_lift': {'pred': F_M_dict['F_pred_modify'][1]},
+                'aerodynamic_drag': {'pred': F_M_dict['F_pred_modify'][0]},
+                'pneumatic_lateral_force': {'pred': F_M_dict['F_pred_modify'][2]},
+                'pneumatic_overturning_moment': {'pred': F_M_dict['M_pred_modify'][0]},
+                'pneumatic_pitching_moment': {'pred': F_M_dict['M_pred_modify'][1]},
+                'pneumatic_roll_moment': {'pred': F_M_dict['M_pred_modify'][2]},
+            }
 
             inference_json_dict['car_speed'] = data_dict["info"][0]["car_speed"]
             inference_json_dict['wind_speed'] = data_dict["info"][0]["wind_speed"]
@@ -263,21 +278,34 @@ def inference(cfg: DictConfig):
 
             mass_density = float(data_dict["info"][0]["density"])
             reference_area = float(data_dict["info"][0]["area"])
-            flow_speed = math.sqrt(float(data_dict["info"][0]["car_speed"])**2 + float(data_dict["info"][0]["wind_speed"])**2)
+            typical_length = float(data_dict["info"][0]["typical_length"])
+            car_speed = float(data_dict["info"][0]["car_speed"])
+            wind_speed = float(data_dict["info"][0]["wind_speed"])
+            wind_angle_rad = math.radians(float(data_dict["info"][0]["wind_angle"]))
+            vx = car_speed + wind_speed * math.cos(wind_angle_rad)
+            vy = wind_speed * math.sin(wind_angle_rad)
+            flow_speed = math.sqrt(vx**2 + vy**2)
             F_const = 2.0 / (mass_density * flow_speed**2 * reference_area)
-            M_const = 2.0 / (mass_density * flow_speed**2 * reference_area * 0.3)
+            M_const = 2.0 / (mass_density * flow_speed**2 * reference_area * typical_length)
 
             for load_name, values in load_types.items():
                 cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
+                cal_val_modify = load_types_modify[load_name]['pred'].numpy() if hasattr(load_types_modify[load_name]['pred'], 'numpy') else load_types_modify[load_name]['pred']
+                # 真·系数空间：修正网络直接输出无量纲系数，故 modify 分支的物理值
+                # 需 ×(1/const) 还原；no_modify 分支仍是骨干积分的物理力，×const 得系数。
                 if load_name in ['aerodynamic_lift', 'aerodynamic_drag', 'pneumatic_lateral_force']:
                     inference_json_dict[load_name] = {
-                        'cal_value': float(cal_val),
-                        'coefficient': float(cal_val)*F_const,
+                        'cal_value': float(cal_val_modify)/F_const,
+                        'coefficient': float(cal_val_modify),
+                        'cal_value_no_modify': float(cal_val),
+                        'coefficient_no_modify': float(cal_val)*F_const,
                     }
                 else:
                     inference_json_dict[load_name] = {
-                        'cal_value': float(cal_val),
-                        'coefficient': float(cal_val)*M_const,
+                        'cal_value': float(cal_val_modify)/M_const,
+                        'coefficient': float(cal_val_modify),
+                        'cal_value_no_modify': float(cal_val),
+                        'coefficient_no_modify': float(cal_val)*M_const,
                     }
 
             append_dict_to_json_list(inference_json_file_path, inference_json_dict)
@@ -299,10 +327,10 @@ def inference(cfg: DictConfig):
 
 
 def save_eval_results(
-    cfg: DictConfig, pred, value, centroid_idx, caseid, decode_fn=None
+    cfg: DictConfig, pred, value, centroid_idx, caseid, decode_fn=None, q_ref=None
 ) -> Tuple[str, str, str]:
-    pred_pressure = decode_fn(pred[0:1, :], 0).cpu().detach().numpy()
-    pred_wallshearstress = decode_fn(pred[1:4, :], 1).cpu().detach().numpy()
+    pred_pressure = decode_fn(pred[0:1, :], 0, q_ref=q_ref).cpu().detach().numpy()
+    pred_wallshearstress = decode_fn(pred[1:4, :], 1, q_ref=q_ref).cpu().detach().numpy()
     evals_results = {
         "cal_pressure_drag": pred_pressure,
         "cal_friction_resistance": pred_wallshearstress,
@@ -376,10 +404,35 @@ def save_eval_results(
     )
 
 
+def quote_non_ascii_overrides(argv: List[str]) -> List[str]:
+    """给含非 ASCII 字符（如中文路径）的 Hydra 覆盖参数值自动加引号。
+
+    Hydra 的命令行 override 语法只允许未加引号的值使用 ASCII 字符，
+    因此像 state=/path/模型训练/x.pdparams 这样的中文路径会触发
+    LexerNoViableAltException。将值用双引号包裹后，Hydra 会把它当作
+    普通字符串处理，从而支持中文等非 ASCII 字符。
+    """
+    result = []
+    for arg in argv:
+        # 只处理 key=value 形式的覆盖参数，跳过 --multirun 等选项。
+        if arg.startswith("-") or "=" not in arg:
+            result.append(arg)
+            continue
+        key, sep, value = arg.partition("=")
+        already_quoted = (
+            len(value) >= 2 and value[0] == value[-1] and value[0] in "'\""
+        )
+        if value and not already_quoted and not value.isascii():
+            value = f'"{value}"'
+        result.append(key + sep + value)
+    return result
+
+
 @hydra.main(version_base=None, config_path="./configs", config_name="inference")
 def main(cfg: DictConfig):
     inference(cfg)
 
 
 if __name__ == "__main__":
+    sys.argv = quote_non_ascii_overrides(sys.argv)
     main()

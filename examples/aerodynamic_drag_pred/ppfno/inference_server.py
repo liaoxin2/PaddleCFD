@@ -35,6 +35,7 @@ from paddle.io import DistributedBatchSampler
 from pydantic import BaseModel
 
 from ppcfd.models.ppfno.data import instantiate_inferencedatamodule
+from ppcfd.models.ppfno.data.datamodule_lazy import compute_q_ref
 from ppcfd.models.ppfno.losses import LpLoss
 from ppcfd.models.ppfno.networks import instantiate_network
 from ppcfd.models.ppfno.optim.schedulers import instantiate_scheduler
@@ -47,9 +48,10 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 
 class InputData(BaseModel):
-    pre_output_path: str  
-    reason_input_path: str 
-    reason_output_path: str 
+    pre_output_path: str
+    reason_input_path: str
+    reason_output_path: str
+    save_eval_results: bool = False
 
 
 class OutputData(BaseModel):
@@ -59,10 +61,10 @@ class OutputData(BaseModel):
     cost_forward: float
     F_pred_modify: List[float]
     M_pred_modify: List[float]
-    pred_pressure_csv_path: str
-    pred_pressure_vtp_path: str
-    pred_wallshearstress_csv_path: str
-    pred_wallshearstress_vtp_path: str
+    pred_pressure_csv_path: Union[str, None]
+    pred_pressure_vtp_path: Union[str, None]
+    pred_wallshearstress_csv_path: Union[str, None]
+    pred_wallshearstress_vtp_path: Union[str, None]
 
 
 # 模型
@@ -118,9 +120,9 @@ def save_vtp_from_dict(
 
         if num_timestamps > 1:
             width = len(str(num_timestamps - 1))
-            point_cloud.save(f"{filename}_t-{t:0{width}}.vtp")
+            point_cloud.save(f"{filename}_t-{t:0{width}}.vtp", binary=True)
         else:
-            point_cloud.save(f"{filename}.vtp")
+            point_cloud.save(f"{filename}.vtp", binary=True)
 
     if num_timestamps > 1:
         logging.info(
@@ -188,7 +190,7 @@ async def health_check():
 
 
 async def async_save_eval_results(
-    cfg, pred, value, indices, caseid, decode_fn, output: OutputData
+    cfg, pred, value, indices, caseid, decode_fn, output: OutputData, q_ref=None
 ):
     try:
         (
@@ -203,6 +205,7 @@ async def async_save_eval_results(
             indices[0],
             caseid,
             decode_fn=decode_fn,
+            q_ref=q_ref,
         )
         
         # 更新输出对象中的文件路径
@@ -313,6 +316,10 @@ async def infer_model_task(input_data: InputData) -> OutputData:
                     data_dict['info'][0]['wind_angle'] = value
                     inference_json_dict['type'] = 'wind_angle'
 
+                # 扫描值已写回 info，须基于当前 wind 值重算 q_ref，
+                # 保证 decode 用的 q_ref 与积分用的 F_const 满足 F_const == 1/(q_ref*A)。
+                data_dict["q_ref"] = [compute_q_ref(data_dict["info"][0])]
+
                 device = ParallelEnv().device_id
                 device = paddle.CUDAPlace(device)
                 try:
@@ -323,30 +330,35 @@ async def infer_model_task(input_data: InputData) -> OutputData:
                     t2 = default_timer()
                     paddle.device.cuda.empty_cache()
                     msg += f"Inference (pure) took {t2 - t1:.2f} seconds."
-                    (
-                        pred_pressure_csv_path,
-                        pred_pressure_vtp_path,
-                        pred_wallshearstress_csv_path,
-                        pred_wallshearstress_vtp_path,
-                    ) = get_pathes(
-                        CFG,
-                        value,
-                        datamodule.inference_full_caseids[0],
-                    )
+                    pred_pressure_csv_path = None
+                    pred_pressure_vtp_path = None
+                    pred_wallshearstress_csv_path = None
+                    pred_wallshearstress_vtp_path = None
+                    if input_data.save_eval_results:
+                        (
+                            pred_pressure_csv_path,
+                            pred_pressure_vtp_path,
+                            pred_wallshearstress_csv_path,
+                            pred_wallshearstress_vtp_path,
+                        ) = get_pathes(
+                            CFG,
+                            value,
+                            datamodule.inference_full_caseids[0],
+                        )
 
                     output = OutputData(
                         error_code=0,
                         error_message="",
                         cost_forward=t2 - t1,
                         cost_all=0.0,
-                        F_pred_modify = F_M_dict["F_pred_modify"].cpu().numpy().tolist(),
-                        M_pred_modify = F_M_dict["M_pred_modify"].cpu().numpy().tolist(),
+                        F_pred_modify = (F_M_dict["F_pred_modify"] / F_M_dict["F_const"]).cpu().numpy().tolist(),
+                        M_pred_modify = (F_M_dict["M_pred_modify"] / F_M_dict["M_const"]).cpu().numpy().tolist(),
                         pred_pressure_csv_path=pred_pressure_csv_path,
                         pred_pressure_vtp_path=pred_pressure_vtp_path,
                         pred_wallshearstress_csv_path=pred_wallshearstress_csv_path,
                         pred_wallshearstress_vtp_path=pred_wallshearstress_vtp_path,
                     )
-                    if CFG.save_eval_results:
+                    if input_data.save_eval_results:
                         
                         await async_save_eval_results(
                             CFG,
@@ -355,7 +367,8 @@ async def infer_model_task(input_data: InputData) -> OutputData:
                             indices,
                             datamodule.inference_full_caseids[0],
                             datamodule.decode,
-                            output
+                            output,
+                            q_ref=data_dict["q_ref"][0],
                         )
                         
 
@@ -365,7 +378,7 @@ async def infer_model_task(input_data: InputData) -> OutputData:
                         logging.info(f"WARNING: OOM on sample {0}, skipping this sample.")
                         if hasattr(paddle.device.cuda, "empty_cache"):
                             paddle.device.cuda.empty_cache()
-                        # continue
+                        raise
                     else:
                         raise
 
@@ -376,8 +389,9 @@ async def infer_model_task(input_data: InputData) -> OutputData:
                         eval_meter.update({k: v})
                 msg += f"|| MRE and Value: "
 
-                F_pred_modify = F_M_dict["F_pred_modify"]
-                M_pred_modify = F_M_dict["M_pred_modify"]
+                # 真·系数空间：折回物理力/力矩用于日志与统计
+                F_pred_modify = F_M_dict["F_pred_modify"] / F_M_dict["F_const"]
+                M_pred_modify = F_M_dict["M_pred_modify"] / F_M_dict["M_const"]
                 F_pred = out_dict["F_pred"]
                 M_pred = out_dict["M_pred"]
                 eval_meter.update({"F_pred_modify": F_pred_modify})
@@ -395,6 +409,14 @@ async def infer_model_task(input_data: InputData) -> OutputData:
                     'pneumatic_pitching_moment': {'pred': F_M_dict['M_pred'][1]},
                     'pneumatic_roll_moment': {'pred': F_M_dict['M_pred'][2]},
                 }
+                load_types_modify = {
+                    'aerodynamic_lift': {'pred': F_M_dict['F_pred_modify'][1]},
+                    'aerodynamic_drag': {'pred': F_M_dict['F_pred_modify'][0]},
+                    'pneumatic_lateral_force': {'pred': F_M_dict['F_pred_modify'][2]},
+                    'pneumatic_overturning_moment': {'pred': F_M_dict['M_pred_modify'][0]},
+                    'pneumatic_pitching_moment': {'pred': F_M_dict['M_pred_modify'][1]},
+                    'pneumatic_roll_moment': {'pred': F_M_dict['M_pred_modify'][2]},
+                }
 
                 inference_json_dict['car_speed'] = data_dict["info"][0]["car_speed"]
                 inference_json_dict['wind_speed'] = data_dict["info"][0]["wind_speed"]
@@ -402,21 +424,34 @@ async def infer_model_task(input_data: InputData) -> OutputData:
 
                 mass_density = float(data_dict["info"][0]["density"])
                 reference_area = float(data_dict["info"][0]["area"])
-                flow_speed = math.sqrt(float(data_dict["info"][0]["car_speed"])**2 + float(data_dict["info"][0]["wind_speed"])**2)
+                typical_length = float(data_dict["info"][0]["typical_length"])
+                car_speed = float(data_dict["info"][0]["car_speed"])
+                wind_speed = float(data_dict["info"][0]["wind_speed"])
+                wind_angle_rad = math.radians(float(data_dict["info"][0]["wind_angle"]))
+                vx = car_speed + wind_speed * math.cos(wind_angle_rad)
+                vy = wind_speed * math.sin(wind_angle_rad)
+                flow_speed = math.sqrt(vx**2 + vy**2)
                 F_const = 2.0 / (mass_density * flow_speed**2 * reference_area)
-                M_const = 2.0 / (mass_density * flow_speed**2 * reference_area * 0.3)
+                M_const = 2.0 / (mass_density * flow_speed**2 * reference_area * typical_length)
 
                 for load_name, values in load_types.items():
                     cal_val = values['pred'].numpy() if hasattr(values['pred'], 'numpy') else values['pred']
+                    cal_val_modify = load_types_modify[load_name]['pred'].numpy() if hasattr(load_types_modify[load_name]['pred'], 'numpy') else load_types_modify[load_name]['pred']
+
+                    # 真·系数空间：modify 分支已是无量纲系数，cal_value 需 ×(1/const) 还原物理量
                     if load_name in ['aerodynamic_lift', 'aerodynamic_drag', 'pneumatic_lateral_force']:
                         inference_json_dict[load_name] = {
-                            'cal_value': float(cal_val),
-                            'coefficient': float(cal_val)*F_const,
+                            'cal_value': float(cal_val_modify)/F_const,
+                            'coefficient': float(cal_val_modify),
+                            'cal_value_no_modify': float(cal_val),
+                            'coefficient_no_modify': float(cal_val)*F_const,
                         }
                     else:
                         inference_json_dict[load_name] = {
-                            'cal_value': float(cal_val),
-                            'coefficient': float(cal_val)*M_const,
+                            'cal_value': float(cal_val_modify)/M_const,
+                            'coefficient': float(cal_val_modify),
+                            'cal_value_no_modify': float(cal_val),
+                            'coefficient_no_modify': float(cal_val)*M_const,
                         }
 
                 append_dict_to_json_list(inference_json_file_path, inference_json_dict)
@@ -472,10 +507,10 @@ async def infer_model(input_data: InputData) -> OutputData:
 
 
 def save_eval_results(
-    cfg: DictConfig, pred, value, centroid_idx, caseid, decode_fn=None
+    cfg: DictConfig, pred, value, centroid_idx, caseid, decode_fn=None, q_ref=None
 ) -> Tuple[str, str, str]:
-    pred_pressure = decode_fn(pred[0:1, :], 0).cpu().detach().numpy()
-    pred_wallshearstress = decode_fn(pred[1:4, :], 1).cpu().detach().numpy()
+    pred_pressure = decode_fn(pred[0:1, :], 0, q_ref=q_ref).cpu().detach().numpy()
+    pred_wallshearstress = decode_fn(pred[1:4, :], 1, q_ref=q_ref).cpu().detach().numpy()
     evals_results = {
         "cal_pressure_drag": pred_pressure,
         "cal_friction_resistance": pred_wallshearstress,
@@ -593,10 +628,37 @@ def get_pathes(
 
 
 
+def quote_non_ascii_overrides(argv: List[str]) -> List[str]:
+    """给含非 ASCII 字符（如中文路径）的 Hydra 覆盖参数值自动加引号。
+
+    Hydra 的命令行 override 语法只允许未加引号的值使用 ASCII 字符，
+    因此像 pd_path=/path/模型训练/x.pdparams 这样的中文路径会触发
+    LexerNoViableAltException。将值用双引号包裹后，Hydra 会把它当作
+    普通字符串处理，从而支持中文等非 ASCII 字符。
+    """
+    result = []
+    for arg in argv:
+        # 只处理 key=value 形式的覆盖参数，跳过 --multirun 等选项。
+        if arg.startswith("-") or "=" not in arg:
+            result.append(arg)
+            continue
+        key, sep, value = arg.partition("=")
+        already_quoted = (
+            len(value) >= 2 and value[0] == value[-1] and value[0] in "'\""
+        )
+        if value and not already_quoted and not value.isascii():
+            value = f'"{value}"'
+        result.append(key + sep + value)
+    return result
+
+
 @hydra.main(version_base=None, config_path="./configs", config_name="inference")
 def main(cfg: DictConfig):
     global CFG
     CFG = cfg
+    from omegaconf import OmegaConf
+    import logging
+    logging.warning(OmegaConf.to_yaml(CFG))
     import uvicorn
 
     port = os.getenv("main", "8087")
@@ -605,4 +667,5 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
+    sys.argv = quote_non_ascii_overrides(sys.argv)
     main()
